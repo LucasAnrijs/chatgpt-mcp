@@ -10,7 +10,7 @@ const {
   CLIENT_ID,
   CLIENT_SECRET,
   DRIVE_ID,
-  FOLDER_ITEM_ID, // optional: folder driveItem id to scope search
+  FOLDER_ITEM_ID, // optional
   MCP_API_KEY,
 } = process.env;
 
@@ -22,7 +22,7 @@ if (!TENANT_ID || !CLIENT_ID || !CLIENT_SECRET || !DRIVE_ID || !MCP_API_KEY) {
 function auth(req: Request, res: Response, next: NextFunction) {
   const hdr = req.header('authorization') || '';
   const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
-  if (!token || token !== MCP_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  if (token !== MCP_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
@@ -60,38 +60,36 @@ async function g<T>(path: string, init?: RequestInit & { raw?: boolean }): Promi
     headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(init?.headers || {}) },
   });
   if (!resp.ok) {
-    const body = await resp.text();
-    throw new Error(`Graph ${resp.status} ${resp.statusText}: ${body}`);
+    let errBody: any;
+    try { errBody = await resp.json(); } catch { errBody = await resp.text(); }
+    throw new Error(`Graph ${resp.status} ${resp.statusText}: ${JSON.stringify(errBody)}`);
   }
   if ((init as any)?.raw) return resp as any;
   return resp.json() as Promise<T>;
 }
 
-// --- Drive configuration ---
+// --- Drive search config ---
 let SEARCH_ROOT_ITEM_ID: string | null = FOLDER_ITEM_ID || null;
 
 // --- Graph API wrappers ---
 const Graph = {
   async search(q: string, top = 20) {
     const base = SEARCH_ROOT_ITEM_ID
-      ? `/drives/${DRIVE_ID}/items/${SEARCH_ROOT_ITEM_ID}/search(q='${encodeURIComponent(q)}')`
-      : `/drives/${DRIVE_ID}/root/search(q='${encodeURIComponent(q)}')`;
-    const qs = `?$top=${top}`;
-    return g<any>(`${base}${qs}`);
+      ? `/drives/${DRIVE_ID}/items/${SEARCH_ROOT_ITEM_ID}/search(q='${q}')`
+      : `/drives/${DRIVE_ID}/root/search(q='${q}')`;
+    return g<any>(`${base}?$top=${top}`);
   },
-
   async getItemById(itemId: string) {
     return g<any>(`/drives/${DRIVE_ID}/items/${itemId}`);
   },
-
-  async downloadById(itemId: string) {
-    return g<any>(`/drives/${DRIVE_ID}/items/${itemId}/content`, { raw: true, method: 'GET' });
+  async downloadById(itemId: string): Promise<globalThis.Response> {
+    return g<globalThis.Response>(`/drives/${DRIVE_ID}/items/${itemId}/content`, { raw: true, method: 'GET' });
   },
 };
 
 // --- MCP Server ---
 function buildServer() {
-  const server = new McpServer({ name: 'sharepoint-drive-connector', version: '1.1.0' });
+  const server = new McpServer({ name: 'sharepoint-drive-connector', version: '1.1.1' });
 
   server.registerTool(
     'search',
@@ -105,7 +103,6 @@ function buildServer() {
     async ({ query, top }) => {
       const res = await Graph.search(query, top ?? 20);
       const items = res?.value ?? [];
-
       const links = items.map((it: any) => ({
         type: 'resource_link' as const,
         uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${it.id}/content`,
@@ -113,7 +110,6 @@ function buildServer() {
         mimeType: it.file?.mimeType,
         description: `driveItem ${it.id}`,
       }));
-
       return {
         content: [
           { type: 'text', text: `Found ${items.length} item(s). Showing up to ${top ?? 20}.` },
@@ -133,15 +129,14 @@ function buildServer() {
     async ({ id }) => {
       const meta = await Graph.getItemById(id);
       if (!meta.file) return { content: [{ type: 'text', text: `Not a file: ${meta.name || id}` }] };
-
       const size = meta.size as number;
       const mime = meta.file.mimeType as string | undefined;
       const isText = mime?.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript'].includes(mime || '');
-      const under1MB = typeof size === 'number' ? size < 1_000_000 : false;
+      const under1MB = size < 1_000_000;
 
       if (isText && under1MB) {
-        const resp: Response = await Graph.downloadById(id) as any;
-        const text = await (resp as any).text();
+        const resp = await Graph.downloadById(id);
+        const text = await resp.text();
         return {
           content: [
             { type: 'text', text: `# ${meta.name}\n(mime: ${mime}, size: ${size}B)` },
@@ -149,7 +144,6 @@ function buildServer() {
           ],
         };
       }
-
       return {
         content: [
           { type: 'text', text: `Large/binary file. Returning link.\n(mime: ${mime}, size: ${size}B)` },
