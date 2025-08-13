@@ -166,6 +166,14 @@ const app = express();
 app.use(express.json());
 app.use(auth);
 
+app.get('/health', (req, res) => {
+    res.json({
+      ok: true,
+      accept: req.headers.accept,
+      contentType: req.headers['content-type']
+    });
+  });
+
 app.post('/mcp', async (req: Request, res: Response) => {
   try {
     const server = buildServer();
