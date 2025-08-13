@@ -72,40 +72,32 @@ let DRIVE_ID: string;
 let SEARCH_ROOT_ITEM_ID: string | null = null; // folder to scope search, else null = drive root
 
 async function initDrive() {
-    // 1. Resolve composite SITE_ID from hostname + path
-    if (!process.env.SITE_HOSTNAME || !process.env.SITE_PATH) {
+    const { SITE_HOSTNAME, SITE_PATH, LIST_ID, FOLDER_ITEM_ID } = process.env;
+    if (!SITE_HOSTNAME || !SITE_PATH) {
       throw new Error('SITE_HOSTNAME and SITE_PATH must be set in .env');
     }
   
-    const siteInfo = await g<any>(
-      `/sites/${encodeURIComponent(process.env.SITE_HOSTNAME)}:${encodeURIComponent(process.env.SITE_PATH)}`
-    );
+    // Keep the colon and slashes; only encode each segment
+    const rawPath = SITE_PATH.replace(/^\/+/, ''); // strip leading slash
+    const encodedPath = rawPath.split('/').map(encodeURIComponent).join('/'); // spaces -> %20, slashes kept
   
+    // IMPORTANT: do NOT encode the hostname; do NOT encode the colon
+    const siteInfo = await g<any>(`/sites/${SITE_HOSTNAME}:/${encodedPath}`);
     const compositeSiteId = siteInfo.id;
-    if (!compositeSiteId) {
-      throw new Error('Could not resolve composite SITE_ID from hostname + path');
-    }
+    if (!compositeSiteId) throw new Error('Could not resolve composite SITE_ID from hostname + path');
   
     console.log(`Resolved SITE_ID: ${compositeSiteId}`);
   
-    // 2. Get the drive from LIST_ID
-    if (!process.env.LIST_ID) {
-      throw new Error('LIST_ID must be set in .env');
-    }
+    if (!LIST_ID) throw new Error('LIST_ID must be set in .env');
   
-    const drive = await g<any>(`/sites/${compositeSiteId}/lists/${process.env.LIST_ID}/drive`);
+    const drive = await g<any>(`/sites/${compositeSiteId}/lists/${LIST_ID}/drive`);
     DRIVE_ID = drive.id;
-    if (!DRIVE_ID) {
-      throw new Error('Could not resolve DRIVE_ID from SITE_ID + LIST_ID');
-    }
+    if (!DRIVE_ID) throw new Error('Could not resolve DRIVE_ID from SITE_ID + LIST_ID');
   
     console.log(`Resolved DRIVE_ID: ${DRIVE_ID}`);
+    SEARCH_ROOT_ITEM_ID = FOLDER_ITEM_ID || null;
+  }
   
-    // 3. If optional folder scope is set
-    SEARCH_ROOT_ITEM_ID = process.env.FOLDER_ITEM_ID || null;
-}
-  
-
 const Graph = {
   // Search within a folder (item) or drive root
   async search(q: string, top = 20) {
