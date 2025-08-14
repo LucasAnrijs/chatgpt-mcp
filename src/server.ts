@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 
 const {
@@ -83,110 +82,6 @@ const Graph = {
   },
 };
 
-// --- MCP server ---
-function buildServer() {
-  const server = new McpServer({ name: 'sharepoint-drive-connector', version: '1.1.1' });
-
-  server.registerTool(
-    'search',
-    {
-      title: 'Search SharePoint drive',
-      description: SEARCH_ROOT_ITEM_ID
-        ? 'Search within the specified folder only'
-        : 'Search the entire document library (drive root)',
-      inputSchema: {
-        query: z.string().min(1),
-        top: z.number().int().min(1).max(50).optional(),
-      },
-    },
-    async ({ query, top }) => {
-      const res = await Graph.search(query, top ?? 20);
-      const items = res?.value ?? [];
-
-      const links = items.map((it: any) => ({
-        type: 'resource_link' as const,
-        uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${it.id}/content`,
-        name: it.name,
-        mimeType: it.file?.mimeType,
-        description: `driveItem ${it.id}`,
-      }));
-
-      return {
-        content: [
-          { type: 'text', text: `Found ${items.length} item(s). Showing up to ${top ?? 20}.` },
-          ...links,
-        ],
-      };
-    }
-  );
-
-  server.registerTool(
-    'fetch',
-    {
-      title: 'Fetch a file by item id',
-      description: 'Return file content inline (if text & small), else a download link',
-      inputSchema: { id: z.string().min(1) },
-    },
-    async ({ id }) => {
-      const meta = await Graph.getItemById(id);
-      if (!meta.file) return { content: [{ type: 'text', text: `Not a file: ${meta.name || id}` }] };
-
-      const size = meta.size as number;
-      const mime = meta.file.mimeType as string | undefined;
-      const isText = mime?.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript'].includes(mime || '');
-      const under1MB = typeof size === 'number' ? size < 1_000_000 : false;
-
-      if (isText && under1MB) {
-        const resp = await Graph.downloadById(id);
-        const text = await resp.text();
-        return {
-          content: [
-            { type: 'text', text: `# ${meta.name}\n(mime: ${mime}, size: ${size}B)` },
-            { type: 'text', text },
-          ],
-        };
-      }
-
-      return {
-        content: [
-          { type: 'text', text: `Large/binary file. Returning link.\n(mime: ${mime}, size: ${size}B)` },
-          {
-            type: 'resource_link',
-            uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${id}/content`,
-            name: meta.name,
-            mimeType: mime,
-            description: `Download ${meta.name}`,
-          },
-        ],
-      };
-    }
-  );
-
-  return server;
-}
-
-// --- Session Management ---
-interface Session {
-  server: McpServer;
-  transport: StreamableHTTPServerTransport;
-  initialized: boolean;
-  lastActivity: number;
-}
-
-const sessions = new Map<string, Session>();
-const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
-
-// Clean up old sessions periodically
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of sessions.entries()) {
-    if (now - session.lastActivity > SESSION_TIMEOUT) {
-      console.log(`[MCP] Cleaning up session ${id}`);
-      sessions.delete(id);
-    }
-  }
-}, 5 * 60 * 1000); // Check every 5 minutes
-
 // --- Express wiring ---
 const app = express();
 app.use(express.json());
@@ -199,129 +94,237 @@ app.get('/version', (_req, res) => {
   res.json({ name: 'sharepoint-drive-connector', version: '1.1.1' });
 });
 
-// Force sane headers for MCP requests (fix 406)
-app.use('/mcp', (req, _res, next) => {
-  console.log('[MCP] incoming', {
-    accept: req.headers.accept,
-    type: req.headers['content-type'],
-    sessionId: req.headers['x-session-id'],
-  });
-  
-  // Ensure the MCP transport-required Accept is present
-  req.headers.accept = 'application/json, text/event-stream';
-  
-  // Ensure Content-Type when a body is posted
-  if (!req.headers['content-type']) {
-    req.headers['content-type'] = 'application/json';
-  }
-  next();
-});
-
-// Auth AFTER public routes (so /health is open)
+// Auth middleware
 function auth(req: Request, res: Response, next: NextFunction) {
   const hdr = req.header('authorization') || '';
   const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
   if (token !== MCP_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
-app.use(auth);
 
-// MCP endpoint with session management
-app.post('/mcp', async (req: Request, res: Response) => {
+// IMPORTANT: Use a custom transport implementation to handle batch requests
+// This bypasses the StreamableHTTPServerTransport entirely
+app.post('/mcp', auth, async (req: Request, res: Response) => {
   try {
-    // Get or create session ID
-    let sessionId = req.headers['x-session-id'] as string;
+    console.log('[MCP] Processing request');
     
-    // Check if this is an initialization request
-    const isInitRequest = Array.isArray(req.body) 
-      ? req.body.some(r => r.method === 'initialize')
-      : req.body.method === 'initialize';
+    // Build a fresh server for each request
+    const server = new McpServer({ name: 'sharepoint-drive-connector', version: '1.1.1' });
     
-    if (!sessionId || isInitRequest) {
-      // Generate new session for initialization
-      sessionId = Math.random().toString(36).slice(2);
-      console.log(`[MCP] Creating new session: ${sessionId}`);
+    // Register tools
+    server.registerTool(
+      'search',
+      {
+        title: 'Search SharePoint drive',
+        description: SEARCH_ROOT_ITEM_ID
+          ? 'Search within the specified folder only'
+          : 'Search the entire document library (drive root)',
+        inputSchema: {
+          query: z.string().min(1),
+          top: z.number().int().min(1).max(50).optional(),
+        },
+      },
+      async ({ query, top }) => {
+        const res = await Graph.search(query, top ?? 20);
+        const items = res?.value ?? [];
+
+        const links = items.map((it: any) => ({
+          type: 'resource_link' as const,
+          uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${it.id}/content`,
+          name: it.name,
+          mimeType: it.file?.mimeType,
+          description: `driveItem ${it.id}`,
+        }));
+
+        return {
+          content: [
+            { type: 'text', text: `Found ${items.length} item(s). Showing up to ${top ?? 20}.` },
+            ...links,
+          ],
+        };
+      }
+    );
+
+    server.registerTool(
+      'fetch',
+      {
+        title: 'Fetch a file by item id',
+        description: 'Return file content inline (if text & small), else a download link',
+        inputSchema: { id: z.string().min(1) },
+      },
+      async ({ id }) => {
+        const meta = await Graph.getItemById(id);
+        if (!meta.file) return { content: [{ type: 'text', text: `Not a file: ${meta.name || id}` }] };
+
+        const size = meta.size as number;
+        const mime = meta.file.mimeType as string | undefined;
+        const isText = mime?.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript'].includes(mime || '');
+        const under1MB = typeof size === 'number' ? size < 1_000_000 : false;
+
+        if (isText && under1MB) {
+          const resp = await Graph.downloadById(id);
+          const text = await resp.text();
+          return {
+            content: [
+              { type: 'text', text: `# ${meta.name}\n(mime: ${mime}, size: ${size}B)` },
+              { type: 'text', text },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            { type: 'text', text: `Large/binary file. Returning link.\n(mime: ${mime}, size: ${size}B)` },
+            {
+              type: 'resource_link',
+              uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${id}/content`,
+              name: meta.name,
+              mimeType: mime,
+              description: `Download ${meta.name}`,
+            },
+          ],
+        };
+      }
+    );
+
+    // Manually handle the JSON-RPC batch request
+    const requests = Array.isArray(req.body) ? req.body : [req.body];
+    const responses: any[] = [];
+    
+    let initialized = false;
+    
+    for (const request of requests) {
+      if (request.method === 'initialize') {
+        // Handle initialization
+        if (initialized) {
+          responses.push({
+            jsonrpc: '2.0',
+            error: { code: -32600, message: 'Already initialized' },
+            id: request.id,
+          });
+        } else {
+          initialized = true;
+          responses.push({
+            jsonrpc: '2.0',
+            result: {
+              protocolVersion: '2024-11-05',
+              capabilities: { tools: { listChanged: true } },
+              serverInfo: { name: 'sharepoint-drive-connector', version: '1.1.1' },
+            },
+            id: request.id,
+          });
+        }
+      } else if (request.method === 'tools/list') {
+        // Handle tools list
+        if (!initialized) {
+          responses.push({
+            jsonrpc: '2.0',
+            error: { code: -32600, message: 'Not initialized' },
+            id: request.id,
+          });
+        } else {
+          responses.push({
+            jsonrpc: '2.0',
+            result: {
+              tools: [
+                {
+                  name: 'search',
+                  title: 'Search SharePoint drive',
+                  description: SEARCH_ROOT_ITEM_ID
+                    ? 'Search within the specified folder only'
+                    : 'Search the entire document library (drive root)',
+                  inputSchema: {
+                    type: 'object',
+                    properties: {
+                      query: { type: 'string', minLength: 1 },
+                      top: { type: 'number', minimum: 1, maximum: 50 },
+                    },
+                    required: ['query'],
+                  },
+                },
+                {
+                  name: 'fetch',
+                  title: 'Fetch a file by item id',
+                  description: 'Return file content inline (if text & small), else a download link',
+                  inputSchema: {
+                    type: 'object',
+                    properties: {
+                      id: { type: 'string', minLength: 1 },
+                    },
+                    required: ['id'],
+                  },
+                },
+              ],
+            },
+            id: request.id,
+          });
+        }
+      } else if (request.method === 'tools/call') {
+        // Handle tool calls
+        if (!initialized) {
+          responses.push({
+            jsonrpc: '2.0',
+            error: { code: -32600, message: 'Not initialized' },
+            id: request.id,
+          });
+        } else {
+          try {
+            const { name, arguments: args } = request.params;
+            
+            // Get the tool handler directly
+            const tools = (server as any)._tools as Map<string, any>;
+            const tool = tools.get(name);
+            
+            if (!tool) {
+              responses.push({
+                jsonrpc: '2.0',
+                error: { code: -32601, message: `Tool not found: ${name}` },
+                id: request.id,
+              });
+            } else {
+              const result = await tool.handler(args);
+              responses.push({
+                jsonrpc: '2.0',
+                result,
+                id: request.id,
+              });
+            }
+          } catch (err: any) {
+            responses.push({
+              jsonrpc: '2.0',
+              error: { code: -32603, message: err.message },
+              id: request.id,
+            });
+          }
+        }
+      } else {
+        // Unknown method
+        responses.push({
+          jsonrpc: '2.0',
+          error: { code: -32601, message: `Method not found: ${request.method}` },
+          id: request.id,
+        });
+      }
     }
     
-    let session = sessions.get(sessionId);
-    
-    if (!session) {
-      // Create new session
-      const server = buildServer();
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => sessionId,
-      });
-      
-      await server.connect(transport);
-      
-      session = {
-        server,
-        transport,
-        initialized: false,
-        lastActivity: Date.now(),
-      };
-      sessions.set(sessionId, session);
-    }
-    
-    // Update last activity
-    session.lastActivity = Date.now();
-    
-    // Set session ID in response header for client to use in subsequent requests
-    res.setHeader('X-Session-Id', sessionId);
-    
-    // Handle the request
-    await session.transport.handleRequest(req, res, req.body);
-    
-    // Mark as initialized after first successful request
-    if (isInitRequest) {
-      session.initialized = true;
+    // Send response
+    if (Array.isArray(req.body)) {
+      res.json(responses);
+    } else {
+      res.json(responses[0]);
     }
     
   } catch (err: any) {
     console.error('[MCP] Error:', err);
-    if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: '2.0',
-        error: { code: -32603, message: err.message },
-        id: null,
-      });
-    }
-  }
-});
-
-// Alternative: Stateless endpoint for single requests
-app.post('/mcp/stateless', async (req: Request, res: Response) => {
-  try {
-    // This endpoint expects a batch request with initialization + actual method call
-    if (!Array.isArray(req.body) || req.body.length < 2) {
-      return res.status(400).json({
-        jsonrpc: '2.0',
-        error: { code: -32600, message: 'Stateless endpoint requires batch request with initialization' },
-        id: null,
-      });
-    }
-    
-    const server = buildServer();
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => Math.random().toString(36).slice(2),
+    res.status(500).json({
+      jsonrpc: '2.0',
+      error: { code: -32603, message: err.message },
+      id: null,
     });
-    
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-    
-  } catch (err: any) {
-    console.error('[MCP] Stateless error:', err);
-    if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: '2.0',
-        error: { code: -32603, message: err.message },
-        id: null,
-      });
-    }
   }
 });
 
 app.listen(Number(PORT), () => {
   console.log(`MCP server on :${PORT} — scoped to ${FOLDER_ITEM_ID ? `folder ${FOLDER_ITEM_ID}` : 'drive root'}`);
-  console.log(`Sessions will timeout after ${SESSION_TIMEOUT / 1000 / 60} minutes of inactivity`);
+  console.log('Server expects batch requests: [initialize, method_call]');
 });
