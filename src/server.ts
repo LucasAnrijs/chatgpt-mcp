@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express, { type Request, type Response, type NextFunction } from 'express';
+import cors from 'cors';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
@@ -73,11 +74,11 @@ let SEARCH_ROOT_ITEM_ID: string | null = FOLDER_ITEM_ID || null;
 // --- Graph wrappers ---
 const Graph = {
   async search(q: string, top = 20) {
-    // URL encode the search query to handle special characters
-    const encodedQuery = encodeURIComponent(q);
+    // Escape single quotes per OData specification
+    const safe = q.replace(/'/g, "''");
     const base = SEARCH_ROOT_ITEM_ID
-      ? `/drives/${DRIVE_ID}/items/${SEARCH_ROOT_ITEM_ID}/search(q='${encodedQuery}')`
-      : `/drives/${DRIVE_ID}/root/search(q='${encodedQuery}')`;
+      ? `/drives/${DRIVE_ID}/items/${SEARCH_ROOT_ITEM_ID}/search(q='${safe}')`
+      : `/drives/${DRIVE_ID}/root/search(q='${safe}')`;
     const url = `${base}?$top=${top}`;
     console.log(`[Graph] Search URL: ${url}`);
     return g<any>(url);
@@ -93,70 +94,242 @@ const Graph = {
 // --- Store tool handlers separately for manual access ---
 const toolHandlers: Record<string, (args: any) => Promise<any>> = {
   search: async ({ query, top }) => {
-    const res = await Graph.search(query, top ?? 20);
-    const items = res?.value ?? [];
+      const res = await Graph.search(query, top ?? 20);
+      const items = res?.value ?? [];
 
-    const links = items.map((it: any) => ({
-      type: 'resource_link' as const,
-      uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${it.id}/content`,
-      name: it.name,
-      mimeType: it.file?.mimeType,
-      description: `driveItem ${it.id}`,
-    }));
+      const links = items.map((it: any) => ({
+        type: 'resource_link' as const,
+        uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${it.id}/content`,
+        name: it.name,
+        mimeType: it.file?.mimeType,
+        description: `driveItem ${it.id}`,
+      }));
 
-    return {
-      content: [
-        { type: 'text', text: `Found ${items.length} item(s). Showing up to ${top ?? 20}.` },
-        ...links,
-      ],
-    };
+      return {
+        content: [
+          { type: 'text', text: `Found ${items.length} item(s). Showing up to ${top ?? 20}.` },
+          ...links,
+        ],
+      };
   },
   
   fetch: async ({ id }) => {
-    const meta = await Graph.getItemById(id);
-    if (!meta.file) return { content: [{ type: 'text', text: `Not a file: ${meta.name || id}` }] };
+      const meta = await Graph.getItemById(id);
+      if (!meta.file) return { content: [{ type: 'text', text: `Not a file: ${meta.name || id}` }] };
 
-    const size = meta.size as number;
-    const mime = meta.file.mimeType as string | undefined;
-    const isText = mime?.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript'].includes(mime || '');
+      const size = meta.size as number;
+      const mime = meta.file.mimeType as string | undefined;
+      const isText = mime?.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript'].includes(mime || '');
     const under1MB = typeof size === 'number' ? size < 1_000_000 : false;
 
-    if (isText && under1MB) {
-      const resp = await Graph.downloadById(id);
-      const text = await resp.text();
+      if (isText && under1MB) {
+        const resp = await Graph.downloadById(id);
+        const text = await resp.text();
+        return {
+          content: [
+            { type: 'text', text: `# ${meta.name}\n(mime: ${mime}, size: ${size}B)` },
+            { type: 'text', text },
+          ],
+        };
+      }
+
       return {
         content: [
-          { type: 'text', text: `# ${meta.name}\n(mime: ${mime}, size: ${size}B)` },
-          { type: 'text', text },
+          { type: 'text', text: `Large/binary file. Returning link.\n(mime: ${mime}, size: ${size}B)` },
+          {
+            type: 'resource_link',
+            uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${id}/content`,
+            name: meta.name,
+            mimeType: mime,
+          description: `Download ${meta.name}`,
+          },
         ],
       };
-    }
-
-    return {
-      content: [
-        { type: 'text', text: `Large/binary file. Returning link.\n(mime: ${mime}, size: ${size}B)` },
-        {
-          type: 'resource_link',
-          uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${id}/content`,
-          name: meta.name,
-          mimeType: mime,
-          description: `Download ${meta.name}`,
-        },
-      ],
-    };
   },
 };
 
 // --- Express wiring ---
 const app = express();
 app.use(express.json());
+app.use(cors({ 
+  origin: ['https://chat.openai.com', 'https://chatgpt.com'],
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Authorization', 'Content-Type', 'Accept']
+}));
 
-// PUBLIC health/version (mount BEFORE auth)
+// PUBLIC endpoints (mount BEFORE auth)
+app.get('/', (_req, res) => {
+  res.json({ status: 'OK' });
+});
+
 app.get('/health', (req, res) => {
   res.json({ ok: true, accept: req.headers.accept, contentType: req.headers['content-type'] });
 });
+
 app.get('/version', (_req, res) => {
   res.json({ name: 'sharepoint-drive-connector', version: '1.1.1' });
+});
+
+app.get('/.well-known/oauth-authorization-server', (_req, res) => {
+  const base = `https://login.microsoftonline.com/${TENANT_ID}`;
+  res.json({
+    issuer: base,
+    authorization_endpoint: `${base}/oauth2/v2.0/authorize`,
+    token_endpoint: `${base}/oauth2/v2.0/token`,
+    jwks_uri: `${base}/discovery/v2.0/keys`,
+    token_endpoint_auth_methods_supported: [
+      "client_secret_post", 
+      "client_secret_basic"
+    ]
+  });
+});
+
+app.get('/.well-known/ai-plugin.json', (req, res) => {
+  res.json({
+    schema_version: "v1",
+    name_for_human: "SharePoint Knowledge Base",
+    name_for_model: "sharepoint_kb",
+    description_for_human: "Search and retrieve files from SharePoint document library",
+    description_for_model: "Search for documents in a SharePoint library using keywords and fetch file contents by ID",
+    auth: {
+      type: "oauth",
+      client_url: `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/authorize`,
+      scope: "https://graph.microsoft.com/.default",
+      authorization_url: `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
+      authorization_content_type: "application/x-www-form-urlencoded",
+      verification_tokens: {
+        openai: process.env.OPENAI_VERIFICATION_TOKEN || "verification-token"
+      }
+    },
+    api: {
+      type: "openapi",
+      url: `${req.protocol}://${req.get('host')}/openapi.json`
+    },
+    logo_url: "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e1/Microsoft_Office_SharePoint_%282019%E2%80%93present%29.svg/512px-Microsoft_Office_SharePoint_%282019%E2%80%93present%29.svg.png",
+    contact_email: "support@example.com",
+    legal_info_url: "https://example.com/legal"
+  });
+});
+
+app.get('/openapi.json', (req, res) => {
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  res.json({
+    openapi: "3.0.1",
+    info: {
+      title: "SharePoint Knowledge Base API",
+      description: "Search and retrieve files from SharePoint document library",
+      version: "1.1.1"
+    },
+    servers: [{ url: baseUrl }],
+    components: {
+      securitySchemes: {
+        OAuth2: {
+          type: "oauth2",
+          flows: {
+            clientCredentials: {
+              tokenUrl: `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
+              scopes: {
+                "https://graph.microsoft.com/.default": "Access Microsoft Graph"
+              }
+            }
+          }
+        }
+      }
+    },
+    security: [{ OAuth2: ["https://graph.microsoft.com/.default"] }],
+    paths: {
+      "/tools/search": {
+        post: {
+          operationId: "searchDocuments",
+          summary: "Search for documents",
+          description: "Search for documents in the SharePoint library using keywords",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    q: {
+                      type: "string",
+                      description: "Search query"
+                    }
+                  },
+                  required: ["q"]
+                }
+              }
+            }
+          },
+          responses: {
+            "200": {
+              description: "Search results",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      results: {
+                        type: "array",
+                        items: {
+                          type: "object",
+                          properties: {
+                            id: { type: "string" },
+                            name: { type: "string" },
+                            webUrl: { type: "string" },
+                            mimeType: { type: "string" },
+                            size: { type: "number" },
+                            lastModified: { type: "string" },
+                            downloadUrl: { type: "string" }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/tools/fetch": {
+        post: {
+          operationId: "fetchDocument",
+          summary: "Download a document",
+          description: "Download a document by its SharePoint item ID",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    id: {
+                      type: "string",
+                      description: "SharePoint item ID"
+                    }
+                  },
+                  required: ["id"]
+                }
+              }
+            }
+          },
+          responses: {
+            "200": {
+              description: "File content",
+              content: {
+                "application/octet-stream": {
+                  schema: {
+                    type: "string",
+                    format: "binary"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  });
 });
 
 // Auth middleware
@@ -310,6 +483,70 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
       error: { code: -32603, message: err.message },
       id: null,
     });
+  }
+});
+
+// REST endpoints for ChatGPT Actions
+app.post('/tools/search', async (req: Request, res: Response) => {
+  try {
+    const query = req.body.q || '';
+    console.log(`[Tool] search called with query="${query}"`);
+    
+    if (!query) {
+      return res.json({ results: [] });
+    }
+    
+    // Search SharePoint
+    const searchResult = await Graph.search(query, 20);
+    const items = searchResult?.value || [];
+    
+    // Convert to simple format for ChatGPT
+    const results = items.map((item: any) => ({
+      id: item.id,
+      name: item.name,
+      webUrl: item.webUrl,
+      mimeType: item.file?.mimeType,
+      size: item.size,
+      lastModified: item.lastModifiedDateTime,
+      downloadUrl: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${item.id}/content`
+    }));
+    
+    console.log(`[Tool] search("${query}") -> ${results.length} results`);
+    return res.json({ results });
+    
+  } catch (error: any) {
+    console.error('[Tool] search error:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/tools/fetch', async (req: Request, res: Response) => {
+  try {
+    const itemId = req.body.id;
+    console.log(`[Tool] fetch called with id="${itemId}"`);
+    
+    if (!itemId) {
+      return res.status(400).json({ error: 'Missing file ID' });
+    }
+    
+    // Get file metadata
+    const meta = await Graph.getItemById(itemId);
+    if (!meta.file) {
+      return res.status(400).json({ error: `Not a file: ${meta.name || itemId}` });
+    }
+    
+    // Download the file content
+    const fileResponse = await Graph.downloadById(itemId);
+    const fileBuffer = await fileResponse.arrayBuffer();
+    
+    // Send file to client
+    res.setHeader('Content-Type', meta.file.mimeType || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${meta.name}"`);
+    res.send(Buffer.from(fileBuffer));
+    
+  } catch (error: any) {
+    console.error('[Tool] fetch error:', error);
+    return res.status(500).json({ error: error.message });
   }
 });
 
