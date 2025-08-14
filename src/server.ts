@@ -23,7 +23,7 @@ if (!TENANT_ID || !CLIENT_ID || !CLIENT_SECRET || !DRIVE_ID || !MCP_API_KEY) {
 }
 
 // Resolve public base URL for links returned to clients
-const RESOLVED_BASE_URL = PUBLIC_BASE_URL || `http://localhost:${PORT}`;
+const RESOLVED_BASE_URL = PUBLIC_BASE_URL || `https://chatgpt-mcp.onrender.com`;
 
 // --- OAuth token cache ---
 let cachedToken: { token: string; exp: number } | null = null;
@@ -235,6 +235,7 @@ app.get('/.well-known/oauth-authorization-server', (_req, res) => {
 
 // Simple OAuth config for ChatGPT (no auth required)
 app.get('/.well-known/oauth-configuration', (_req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
   res.json({
     authorization_url: `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/authorize`,
     token_url: `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
