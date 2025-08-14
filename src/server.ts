@@ -2,8 +2,6 @@ import 'dotenv/config';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import cors from 'cors';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 
 const {
@@ -95,105 +93,85 @@ const Graph = {
   },
 };
 
-// --- Tool handlers (MCP) ---
-const toolHandlers: Record<string, (args: any) => Promise<any>> = {
-  // Return stable IDs via structuredContent; no Graph URLs here
-  search: async ({ query, top }) => {
-    console.log('[DEBUG] search tool invoked', { query, top });
+// Simple tool implementations matching Python FastMCP pattern
+const mcpTools = {
+  async search(query: string): Promise<any[]> {
+    console.log(`[MCP] search called with query="${query}"`);
     try {
-      const res = await Graph.search(query, top ?? 20);
-      console.log('[DEBUG] Graph.search returned', res?.value?.length);
-      const items = (res?.value ?? []).map((it: any) => ({
-        id: it.id,
-        name: it.name,
-        mimeType: it.file?.mimeType,
+      if (!query) return [];
+
+      const res = await Graph.search(query, 20);
+      const items = res?.value || [];
+      
+      // Return simple array like Python version
+      const results = items.map((item: any) => ({
+        id: item.id,
+        title: item.name,
+        text: `${item.name} | ${item.webUrl || ''} | [Call fetch(id) for full content]`.slice(0, 500),
+        url: item.webUrl || '',
       }));
-      return {
-        content: [{ type: 'text', text: `Found ${items.length} item(s).` }],
-        structuredContent: { items },
-      };
+
+      console.log(`[MCP] search("${query}") -> ${results.length} results`);
+      return results;
     } catch (e: any) {
-      console.error('[ERROR] search tool failed', e);
-      return {
-        content: [{ type: 'text', text: `Search failed: ${e?.message || e}` }],
-        structuredContent: { items: [] },
-      };
+      console.error('[MCP] search error:', e);
+      return [];
     }
   },
 
-  // Accept either { id } or { ids: string[] }
-  fetch: async ({ id, ids }: { id?: string; ids?: string[] }) => {
-    const targetIds = (Array.isArray(ids) && ids.length > 0) ? ids : (id ? [id] : []);
-    if (targetIds.length === 0) {
-      return { content: [{ type: 'text', text: 'No id(s) provided' }] };
-    }
-
-    const content: any[] = [];
-
-    for (const curId of targetIds) {
-      try {
-        const meta = await Graph.getItemById(curId);
-        if (!meta.file) {
-          content.push({ type: 'text', text: `Not a file: ${meta.name || curId}` });
-          continue;
-        }
-
-        const size = meta.size as number;
-        const mime = meta.file.mimeType as string | undefined;
-        const isText = !!(mime && (mime.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript'].includes(mime)));
-        const under1MB = typeof size === 'number' ? size < 1_000_000 : false;
-
-        if (isText && under1MB) {
-          const resp = await Graph.downloadById(curId);
-          const text = await resp.text();
-          content.push({ type: 'text', text: `# ${meta.name}\n(mime: ${mime}, size: ${size}B)` });
-          content.push({ type: 'text', text });
-          content.push({ type: 'resource', resource: { uri: `sp://${curId}`, title: meta.name, mimeType: mime, text } });
-        } else {
-          content.push({ type: 'text', text: `Large/binary file: ${meta.name} (mime: ${mime}, size: ${size}B)` });
-          content.push({
-            type: 'resource_link',
-            uri: `${RESOLVED_BASE_URL}/download/${curId}`,
-            name: meta.name,
-            mimeType: mime,
-            description: `Download ${meta.name}`,
-          });
-        }
-      } catch (e: any) {
-        console.error(`[ERROR] fetch failed for ${curId}`, e);
-        content.push({ type: 'text', text: `Fetch failed for ${curId}: ${e?.message || e}` });
+  async fetch(id: string): Promise<any> {
+    console.log(`[MCP] fetch called with id="${id}"`);
+    try {
+      if (!id) {
+        return { id: '', title: 'No ID provided', text: '', url: '', metadata: {} };
       }
-    }
 
-    return { content };
+      const meta = await Graph.getItemById(id);
+      if (!meta.file) {
+        return { 
+          id, 
+          title: `${meta.name || id} (not a file)`, 
+          text: 'Not a file', 
+          url: meta.webUrl || '', 
+          metadata: {} 
+        };
+      }
+
+      // Return metadata text like Python version
+      const lines = [
+        `Name: ${meta.name}`,
+        `Modified: ${meta.lastModifiedDateTime}`,
+        `Size: ${meta.size}`,
+        `Type: ${meta.file.mimeType}`,
+      ];
+      const text = lines.join('\n');
+
+      return {
+        id,
+        title: meta.name,
+        text,
+        url: meta.webUrl || '',
+        metadata: {
+          created: meta.createdDateTime,
+          modified: meta.lastModifiedDateTime,
+          size: meta.size,
+          mimeType: meta.file.mimeType,
+        }
+      };
+    } catch (e: any) {
+      console.error('[MCP] fetch error:', e);
+      return { 
+        id, 
+        title: `Item ${id} (error)`, 
+        text: '', 
+        url: '', 
+        metadata: { error: e.message } 
+      };
+    }
   },
 };
 
-function buildMcpServer() {
-	const server = new McpServer({ name: 'sharepoint-drive-connector', version: '1.2.0' });
 
-	server.registerTool(
-		'search',
-		{
-			title: 'Search SharePoint drive',
-			description: 'Search the entire document library (drive root)',
-			inputSchema: { query: z.string().min(1), top: z.number().int().min(1).max(50).optional() },
-		},
-		async ({ query, top }) => toolHandlers.search!({ query, top })
-	);
-
-	server.registerTool(
-		'fetch',
-		{
-			title: 'Fetch file(s) by item id',
-			description: 'Return inline content for small text; otherwise a proxy download link',
-			inputSchema: { id: z.string().optional(), ids: z.array(z.string()).optional() },
-		},
-		async ({ id, ids }) => toolHandlers.fetch!({ id, ids })
-	);
-
-	return server;
-}
 
 // --- Express wiring ---
 const app = express();
@@ -413,7 +391,7 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
           try {
             const { name, arguments: args } = request.params;
             console.log(`[MCP] Calling tool: ${name} with args:`, args);
-            const handler = toolHandlers[name];
+            const handler = mcpTools[name as keyof typeof mcpTools];
             if (!handler) {
               responses.push({
                 jsonrpc: '2.0',
@@ -458,29 +436,62 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
   }
 });
 
-// Simplified MCP endpoint for Deep Research connectors (no auth for testing)
-app.post('/mcp/connect', async (req, res) => {
-  try {
-    const server = buildMcpServer();
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => Math.random().toString(36).slice(2),
+// Simple SSE MCP endpoint matching Python FastMCP pattern (no auth)
+app.all('/mcp/simple', async (req, res) => {
+  if (req.method === 'GET') {
+    // Set up SSE stream
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Content-Type',
     });
     
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
+    // Send keep-alive
+    const keepAlive = setInterval(() => {
+      res.write('data: {"type":"ping"}\n\n');
+    }, 30000);
     
-    res.on('close', () => {
-      transport.close();
-      server.close();
+    req.on('close', () => {
+      clearInterval(keepAlive);
     });
-  } catch (err: any) {
-    console.error('[MCP] Error:', err);
-    if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: '2.0',
-        error: { code: -32603, message: err.message },
-        id: null,
-      });
+    
+    res.write('data: {"type":"connected"}\n\n');
+    return;
+  }
+  
+  if (req.method === 'POST') {
+    try {
+      const { method, params } = req.body;
+      console.log(`[SimpleMCP] ${method}`, params);
+      
+      if (method === 'tools/list') {
+        return res.json({
+          tools: [
+            { name: 'search', description: 'Search SharePoint documents' },
+            { name: 'fetch', description: 'Fetch document by ID' }
+          ]
+        });
+      }
+      
+      if (method === 'tools/call') {
+        const { name, arguments: args } = params;
+        if (name === 'search') {
+          const results = await mcpTools.search(args.query || '');
+          return res.json(results);
+        }
+        if (name === 'fetch') {
+          const result = await mcpTools.fetch(args.id || '');
+          return res.json(result);
+        }
+        return res.status(400).json({ error: `Unknown tool: ${name}` });
+      }
+      
+      return res.status(400).json({ error: `Unknown method: ${method}` });
+    } catch (err: any) {
+      console.error('[SimpleMCP] Error:', err);
+      return res.status(500).json({ error: err.message });
     }
   }
 });
