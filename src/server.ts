@@ -447,23 +447,31 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
   }
 });
 
-// Shared SSE transport/server (lazy-initialized) so clients can GET (event stream)
-// and POST (messages) to the same endpoint
-let sseServer: McpServer | null = null;
-let sseTransport: StreamableHTTPServerTransport | null = null;
-async function ensureSseServer() {
-  if (!sseServer || !sseTransport) {
-    sseServer = buildMcpServer();
-    sseTransport = new StreamableHTTPServerTransport({
+// SSE endpoint with proper session handling
+app.all('/mcp/sse', auth, async (req, res) => {
+  try {
+    const server = buildMcpServer();
+    const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => Math.random().toString(36).slice(2),
     });
-    await sseServer.connect(sseTransport);
+    
+    res.on('close', () => {
+      transport.close();
+      server.close();
+    });
+    
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err: any) {
+    console.error('[SSE] Error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: err.message },
+        id: null,
+      });
+    }
   }
-}
-
-app.all('/mcp/sse', auth, async (req, res) => {
-  await ensureSseServer();
-  await sseTransport!.handleRequest(req, res, req.body);
 });
 
 // PUBLIC proxy for downloads so clients don\'t need Graph auth
