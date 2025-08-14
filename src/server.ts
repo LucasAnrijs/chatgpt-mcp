@@ -47,7 +47,11 @@ async function getGraphToken(): Promise<string> {
 // --- Graph helper ---
 async function g<T>(path: string, init?: RequestInit & { raw?: boolean }): Promise<T> {
   const token = await getGraphToken();
-  const url = new URL(path, 'https://graph.microsoft.com/v1.0');
+  // Fix: Ensure path starts with / and construct full URL properly
+  const fullPath = path.startsWith('/') ? path : `/${path}`;
+  const url = `https://graph.microsoft.com/v1.0${fullPath}`;
+  console.log(`[Graph] Calling: ${url}`);
+  
   const resp = await fetch(url, {
     ...init,
     headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(init?.headers || {}) },
@@ -69,10 +73,14 @@ let SEARCH_ROOT_ITEM_ID: string | null = FOLDER_ITEM_ID || null;
 // --- Graph wrappers ---
 const Graph = {
   async search(q: string, top = 20) {
+    // URL encode the search query to handle special characters
+    const encodedQuery = encodeURIComponent(q);
     const base = SEARCH_ROOT_ITEM_ID
-      ? `/drives/${DRIVE_ID}/items/${SEARCH_ROOT_ITEM_ID}/search(q='${q}')`
-      : `/drives/${DRIVE_ID}/root/search(q='${q}')`;
-    return g<any>(`${base}?$top=${top}`);
+      ? `/drives/${DRIVE_ID}/items/${SEARCH_ROOT_ITEM_ID}/search(q='${encodedQuery}')`
+      : `/drives/${DRIVE_ID}/root/search(q='${encodedQuery}')`;
+    const url = `${base}?$top=${top}`;
+    console.log(`[Graph] Search URL: ${url}`);
+    return g<any>(url);
   },
   async getItemById(itemId: string) {
     return g<any>(`/drives/${DRIVE_ID}/items/${itemId}`);
