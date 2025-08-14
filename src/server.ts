@@ -136,8 +136,8 @@ const Graph = {
       return result;
     }
     
-    // Use tenant-wide search for broader coverage
-    const searchPromise = this.tenantWideSearch(normalizedQuery, top);
+    // Use drive search (tenant-wide search requires region config)
+    const searchPromise = this.driveSearch(normalizedQuery, top);
     inFlightQueries.set(cacheKey, searchPromise);
     
     try {
@@ -155,45 +155,7 @@ const Graph = {
     }
   },
 
-  async tenantWideSearch(q: string, top = 25) {
-    console.log(`[Graph] Attempting tenant-wide search: "${q}"`);
-    
-    // Try Microsoft Search API first, but fallback immediately if not available
-    try {
-      const searchBody = {
-        requests: [{
-          entityTypes: ["driveItem"],
-          query: { queryString: q },
-          from: 0,
-          size: top
-        }]
-      };
 
-      const result = await g<any>('/search/query', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(searchBody)
-      });
-      
-      const hits = result?.value?.[0]?.hitsContainers?.[0]?.hits || [];
-      const items = hits.map((hit: any) => ({
-        id: hit.resource.id,
-        name: hit.resource.name,
-        webUrl: hit.resource.webUrl,
-        createdDateTime: hit.resource.createdDateTime,
-        lastModifiedDateTime: hit.resource.lastModifiedDateTime,
-        file: hit.resource.file,
-        size: hit.resource.size,
-        parentReference: hit.resource.parentReference
-      }));
-      
-      console.log(`[Graph] Tenant search "${q}" -> ${items.length} results`);
-      return { value: items };
-    } catch (e: any) {
-      console.log(`[Graph] Tenant search not available (${e.message}), using drive search`);
-      return this.driveSearch(q, top);
-    }
-  },
 
   async driveSearch(q: string, top = 25) {
     const safe = q.replace(/'/g, "''");
@@ -201,7 +163,7 @@ const Graph = {
       ? `/drives/${DRIVE_ID}/items/${SEARCH_ROOT_ITEM_ID}/search(q='${safe}')`
       : `/drives/${DRIVE_ID}/root/search(q='${safe}')`;
     const url = `${base}?$top=${top}`;
-    console.log(`[Graph] Drive search URL: ${url}`);
+    console.log(`[Graph] Drive search: "${q}" -> ${url}`);
     return g<any>(url);
   },
 
