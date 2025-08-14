@@ -165,6 +165,28 @@ function buildServer() {
   return server;
 }
 
+// --- Session Management ---
+interface Session {
+  server: McpServer;
+  transport: StreamableHTTPServerTransport;
+  initialized: boolean;
+  lastActivity: number;
+}
+
+const sessions = new Map<string, Session>();
+const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+
+// Clean up old sessions periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of sessions.entries()) {
+    if (now - session.lastActivity > SESSION_TIMEOUT) {
+      console.log(`[MCP] Cleaning up session ${id}`);
+      sessions.delete(id);
+    }
+  }
+}, 5 * 60 * 1000); // Check every 5 minutes
+
 // --- Express wiring ---
 const app = express();
 app.use(express.json());
@@ -179,24 +201,22 @@ app.get('/version', (_req, res) => {
 
 // Force sane headers for MCP requests (fix 406)
 app.use('/mcp', (req, _res, next) => {
-    // Helpful one-line log
-    console.log('[MCP] incoming', {
-      accept: req.headers.accept,
-      type: req.headers['content-type'],
-    });
+  console.log('[MCP] incoming', {
+    accept: req.headers.accept,
+    type: req.headers['content-type'],
+    sessionId: req.headers['x-session-id'],
+  });
   
-    // Ensure the MCP transport-required Accept is present
-    req.headers.accept = 'application/json, text/event-stream';
+  // Ensure the MCP transport-required Accept is present
+  req.headers.accept = 'application/json, text/event-stream';
   
-    // Ensure Content-Type when a body is posted
-    if (!req.headers['content-type']) {
-      req.headers['content-type'] = 'application/json';
-    }
-    next();
+  // Ensure Content-Type when a body is posted
+  if (!req.headers['content-type']) {
+    req.headers['content-type'] = 'application/json';
+  }
+  next();
 });
-  
-  
-  
+
 // Auth AFTER public routes (so /health is open)
 function auth(req: Request, res: Response, next: NextFunction) {
   const hdr = req.header('authorization') || '';
@@ -206,33 +226,102 @@ function auth(req: Request, res: Response, next: NextFunction) {
 }
 app.use(auth);
 
-// MCP endpoint
-// MCP endpoint (no auto-init, single handleRequest)
+// MCP endpoint with session management
 app.post('/mcp', async (req: Request, res: Response) => {
-    try {
+  try {
+    // Get or create session ID
+    let sessionId = req.headers['x-session-id'] as string;
+    
+    // Check if this is an initialization request
+    const isInitRequest = Array.isArray(req.body) 
+      ? req.body.some(r => r.method === 'initialize')
+      : req.body.method === 'initialize';
+    
+    if (!sessionId || isInitRequest) {
+      // Generate new session for initialization
+      sessionId = Math.random().toString(36).slice(2);
+      console.log(`[MCP] Creating new session: ${sessionId}`);
+    }
+    
+    let session = sessions.get(sessionId);
+    
+    if (!session) {
+      // Create new session
       const server = buildServer();
       const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => Math.random().toString(36).slice(2),
+        sessionIdGenerator: () => sessionId,
       });
-  
+      
       await server.connect(transport);
-  
-      // IMPORTANT: exactly one call; client must send initialize in same request
-      await transport.handleRequest(req, res, req.body);
-    } catch (err: any) {
-      console.error(err);
-      if (!res.headersSent) {
-        res.status(500).json({
-          jsonrpc: '2.0',
-          error: { code: -32603, message: err.message },
-          id: null,
-        });
-      }
+      
+      session = {
+        server,
+        transport,
+        initialized: false,
+        lastActivity: Date.now(),
+      };
+      sessions.set(sessionId, session);
     }
+    
+    // Update last activity
+    session.lastActivity = Date.now();
+    
+    // Set session ID in response header for client to use in subsequent requests
+    res.setHeader('X-Session-Id', sessionId);
+    
+    // Handle the request
+    await session.transport.handleRequest(req, res, req.body);
+    
+    // Mark as initialized after first successful request
+    if (isInitRequest) {
+      session.initialized = true;
+    }
+    
+  } catch (err: any) {
+    console.error('[MCP] Error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: err.message },
+        id: null,
+      });
+    }
+  }
 });
-  
-  
+
+// Alternative: Stateless endpoint for single requests
+app.post('/mcp/stateless', async (req: Request, res: Response) => {
+  try {
+    // This endpoint expects a batch request with initialization + actual method call
+    if (!Array.isArray(req.body) || req.body.length < 2) {
+      return res.status(400).json({
+        jsonrpc: '2.0',
+        error: { code: -32600, message: 'Stateless endpoint requires batch request with initialization' },
+        id: null,
+      });
+    }
+    
+    const server = buildServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => Math.random().toString(36).slice(2),
+    });
+    
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+    
+  } catch (err: any) {
+    console.error('[MCP] Stateless error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: err.message },
+        id: null,
+      });
+    }
+  }
+});
 
 app.listen(Number(PORT), () => {
   console.log(`MCP server on :${PORT} — scoped to ${FOLDER_ITEM_ID ? `folder ${FOLDER_ITEM_ID}` : 'drive root'}`);
+  console.log(`Sessions will timeout after ${SESSION_TIMEOUT / 1000 / 60} minutes of inactivity`);
 });
