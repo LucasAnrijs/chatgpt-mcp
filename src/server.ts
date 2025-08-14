@@ -3,6 +3,7 @@ import express, { type Request, type Response, type NextFunction } from 'express
 import cors from 'cors';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 const {
   PORT = '3000',
@@ -12,6 +13,7 @@ const {
   DRIVE_ID,
   FOLDER_ITEM_ID, // optional
   MCP_API_KEY,
+  OAUTH_AUDIENCE, // optional override (defaults to CLIENT_ID)
 } = process.env;
 
 if (!TENANT_ID || !CLIENT_ID || !CLIENT_SECRET || !DRIVE_ID || !MCP_API_KEY) {
@@ -333,11 +335,34 @@ app.get('/openapi.json', (req, res) => {
 });
 
 // Auth middleware
-function auth(req: Request, res: Response, next: NextFunction) {
-  const hdr = req.header('authorization') || '';
-  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
-  if (token !== MCP_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
-  next();
+const jwks = createRemoteJWKSet(new URL(`https://login.microsoftonline.com/${TENANT_ID}/discovery/v2.0/keys`));
+const acceptedIssuers = [
+  `https://login.microsoftonline.com/${TENANT_ID}/v2.0`,
+  `https://sts.windows.net/${TENANT_ID}/`,
+];
+const expectedAudience = OAUTH_AUDIENCE || CLIENT_ID!;
+
+async function auth(req: Request, res: Response, next: NextFunction) {
+  try {
+    const hdr = req.header('authorization') || '';
+    const bearer = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
+    if (!bearer) return res.status(401).json({ error: 'Missing Authorization header' });
+
+    // Back-compat: allow static key as bearer
+    if (bearer === MCP_API_KEY) return next();
+
+    // Verify JWT issued by Microsoft Entra ID
+    const { payload } = await jwtVerify(bearer, jwks, {
+      issuer: acceptedIssuers,
+      audience: expectedAudience,
+    });
+
+    // Optional: basic scope/role hint logging
+    (req as any).oauth = { sub: payload.sub, appid: (payload as any).appid, roles: (payload as any).roles };
+    return next();
+  } catch (err: any) {
+    return res.status(401).json({ error: 'Unauthorized', details: err?.message });
+  }
 }
 
 // MCP endpoint - Handle batch requests with manual JSON-RPC processing
