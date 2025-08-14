@@ -177,6 +177,15 @@ app.get('/version', (_req, res) => {
   res.json({ name: 'sharepoint-drive-connector', version: '1.1.1' });
 });
 
+// Force sane headers for MCP requests (fix 406)
+app.use('/mcp', (req, _res, next) => {
+    // Some clients send */* or nothing; make it explicit
+    req.headers.accept = 'application/json';
+    // PowerShell sometimes omits Content-Type even when a body is present
+    if (!req.headers['content-type']) req.headers['content-type'] = 'application/json';
+    next();
+});
+  
 // Auth AFTER public routes (so /health is open)
 function auth(req: Request, res: Response, next: NextFunction) {
   const hdr = req.header('authorization') || '';
