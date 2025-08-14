@@ -208,24 +208,51 @@ app.use(auth);
 
 // MCP endpoint
 app.post('/mcp', async (req: Request, res: Response) => {
-  try {
-    const server = buildServer();
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => Math.random().toString(36).slice(2),
-    });
-    res.on('close', () => {
-      transport.close();
-      server.close();
-    });
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-  } catch (err: any) {
-    console.error(err);
-    if (!res.headersSent) {
-      res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: err.message }, id: null });
+    try {
+      const server = buildServer();
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => Math.random().toString(36).slice(2),
+      });
+  
+      // Connect the transport
+      await server.connect(transport);
+  
+      // Decide if we need to auto-initialize
+      const body = req.body;
+      const hasInitialize =
+        (Array.isArray(body) && body.some((m) => m?.method === 'initialize')) ||
+        (body && body.method === 'initialize');
+  
+      if (!hasInitialize) {
+        // Send an initialize frame first so subsequent frames work
+        const initFrame = {
+          jsonrpc: '2.0',
+          id: '__auto__',
+          method: 'initialize',
+          params: {
+            clientInfo: { name: 'auto-init', version: '1.0.0' },
+            protocolVersion: '2024-11-05',
+            capabilities: {},
+          },
+        };
+        // Emit initialize BEFORE handling the incoming request
+        await transport.handleRequest(req, res, initFrame);
+      }
+  
+      // Now handle the original request (tools/list, tools/call, or batch)
+      await transport.handleRequest(req, res, body);
+    } catch (err: any) {
+      console.error(err);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: '2.0',
+          error: { code: -32603, message: err.message },
+          id: null,
+        });
+      }
     }
-  }
 });
+  
 
 app.listen(Number(PORT), () => {
   console.log(`MCP server on :${PORT} — scoped to ${FOLDER_ITEM_ID ? `folder ${FOLDER_ITEM_ID}` : 'drive root'}`);
