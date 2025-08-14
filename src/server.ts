@@ -233,6 +233,16 @@ app.get('/.well-known/oauth-authorization-server', (_req, res) => {
   });
 });
 
+// Simple OAuth config for ChatGPT (no auth required)
+app.get('/.well-known/oauth-configuration', (_req, res) => {
+  res.json({
+    authorization_url: `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/authorize`,
+    token_url: `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
+    client_id: CLIENT_ID,
+    scope: 'https://graph.microsoft.com/.default',
+  });
+});
+
 // OAuth Protected Resource Metadata (RFC 9728) — consulted by MCP clients
 app.get('/.well-known/oauth-protected-resource', (req, res) => {
   const resource = OAUTH_AUDIENCE || CLIENT_ID!; // expected audience your server validates
@@ -447,8 +457,8 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
   }
 });
 
-// Simplified MCP endpoint for Deep Research connectors
-app.post('/mcp/connect', auth, async (req, res) => {
+// Simplified MCP endpoint for Deep Research connectors (no auth for testing)
+app.post('/mcp/connect', async (req, res) => {
   try {
     const server = buildMcpServer();
     const transport = new StreamableHTTPServerTransport({
