@@ -436,63 +436,93 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
   }
 });
 
-// Simple SSE MCP endpoint matching Python FastMCP pattern (no auth)
-app.all('/mcp/simple', async (req, res) => {
-  if (req.method === 'GET') {
-    // Set up SSE stream
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    });
-    
-    // Send keep-alive
-    const keepAlive = setInterval(() => {
-      res.write('data: {"type":"ping"}\n\n');
-    }, 30000);
-    
-    req.on('close', () => {
-      clearInterval(keepAlive);
-    });
-    
-    res.write('data: {"type":"connected"}\n\n');
-    return;
-  }
+// FastMCP-compatible SSE endpoint (matches your working Python exactly)
+app.get('/mcp/sse', (req, res) => {
+  console.log('[FastMCP] SSE connection established');
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  });
   
-  if (req.method === 'POST') {
-    try {
-      const { method, params } = req.body;
-      console.log(`[SimpleMCP] ${method}`, params);
-      
-      if (method === 'tools/list') {
-        return res.json({
-          tools: [
-            { name: 'search', description: 'Search SharePoint documents' },
-            { name: 'fetch', description: 'Fetch document by ID' }
-          ]
-        });
-      }
-      
-      if (method === 'tools/call') {
-        const { name, arguments: args } = params;
-        if (name === 'search') {
-          const results = await mcpTools.search(args.query || '');
-          return res.json(results);
-        }
-        if (name === 'fetch') {
-          const result = await mcpTools.fetch(args.id || '');
-          return res.json(result);
-        }
-        return res.status(400).json({ error: `Unknown tool: ${name}` });
-      }
-      
-      return res.status(400).json({ error: `Unknown method: ${method}` });
-    } catch (err: any) {
-      console.error('[SimpleMCP] Error:', err);
-      return res.status(500).json({ error: err.message });
+  // Send initial connection message
+  res.write('data: {"type": "connection_established"}\n\n');
+  
+  // Keep connection alive
+  const keepAlive = setInterval(() => {
+    res.write(': keepalive\n\n');
+  }, 30000);
+  
+  req.on('close', () => {
+    console.log('[FastMCP] SSE connection closed');
+    clearInterval(keepAlive);
+  });
+});
+
+app.post('/mcp/sse', async (req, res) => {
+  try {
+    console.log('[FastMCP] Request:', JSON.stringify(req.body, null, 2));
+    
+    const { method, params = {} } = req.body;
+    
+    if (method === 'ping') {
+      return res.json({ type: 'pong' });
     }
+    
+    if (method === 'tools/list') {
+      return res.json({
+        tools: [
+          {
+            name: 'search',
+            description: 'Search SharePoint documents',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                query: { type: 'string', description: 'Search query' }
+              },
+              required: ['query']
+            }
+          },
+          {
+            name: 'fetch', 
+            description: 'Fetch document by ID',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', description: 'Document ID' }
+              },
+              required: ['id']
+            }
+          }
+        ]
+      });
+    }
+    
+    if (method === 'tools/call') {
+      const { name, arguments: args } = params;
+      console.log(`[FastMCP] Tool call: ${name}`, args);
+      
+      if (name === 'search') {
+        const results = await mcpTools.search(args?.query || '');
+        console.log(`[FastMCP] Search results: ${results.length} items`);
+        return res.json(results);
+      }
+      
+      if (name === 'fetch') {
+        const result = await mcpTools.fetch(args?.id || '');
+        console.log(`[FastMCP] Fetch result:`, result.title);
+        return res.json(result);
+      }
+      
+      return res.status(400).json({ error: `Unknown tool: ${name}` });
+    }
+    
+    return res.status(400).json({ error: `Unknown method: ${method}` });
+  } catch (err: any) {
+    console.error('[FastMCP] Error:', err);
+    return res.status(500).json({ error: err.message, stack: err.stack });
   }
 });
 
