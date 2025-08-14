@@ -2,6 +2,9 @@ import 'dotenv/config';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import cors from 'cors';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { z } from 'zod';
 
 const {
   PORT = '3000',
@@ -165,6 +168,32 @@ const toolHandlers: Record<string, (args: any) => Promise<any>> = {
     return { content };
   },
 };
+
+function buildMcpServer() {
+	const server = new McpServer({ name: 'sharepoint-drive-connector', version: '1.2.0' });
+
+	server.registerTool(
+		'search',
+		{
+			title: 'Search SharePoint drive',
+			description: 'Search the entire document library (drive root)',
+			inputSchema: { query: z.string().min(1), top: z.number().int().min(1).max(50).optional() },
+		},
+		async ({ query, top }) => toolHandlers.search!({ query, top })
+	);
+
+	server.registerTool(
+		'fetch',
+		{
+			title: 'Fetch file(s) by item id',
+			description: 'Return inline content for small text; otherwise a proxy download link',
+			inputSchema: { id: z.string().optional(), ids: z.array(z.string()).optional() },
+		},
+		async ({ id, ids }) => toolHandlers.fetch!({ id, ids })
+	);
+
+	return server;
+}
 
 // --- Express wiring ---
 const app = express();
@@ -416,6 +445,16 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
       id: null,
     });
   }
+});
+
+app.get('/mcp/sse', auth, async (req, res) => {
+	const server = buildMcpServer();
+	const transport = new StreamableHTTPServerTransport({
+		sessionIdGenerator: () => Math.random().toString(36).slice(2),
+	});
+	res.on('close', () => { transport.close(); server.close(); });
+	await server.connect(transport);
+	await transport.handleRequest(req, res);
 });
 
 // PUBLIC proxy for downloads so clients don\'t need Graph auth
