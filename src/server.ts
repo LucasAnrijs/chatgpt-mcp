@@ -16,9 +16,20 @@ const {
   PUBLIC_BASE_URL, // optional; used for absolute download links
 } = process.env;
 
-if (!TENANT_ID || !CLIENT_ID || !CLIENT_SECRET || !DRIVE_ID || !MCP_API_KEY) {
-  throw new Error('Missing required env vars (TENANT_ID, CLIENT_ID, CLIENT_SECRET, DRIVE_ID, MCP_API_KEY)');
+console.log('🔧 Checking environment variables...');
+const missingVars = [];
+if (!TENANT_ID) missingVars.push('TENANT_ID');
+if (!CLIENT_ID) missingVars.push('CLIENT_ID');
+if (!CLIENT_SECRET) missingVars.push('CLIENT_SECRET');
+if (!DRIVE_ID) missingVars.push('DRIVE_ID');
+if (!MCP_API_KEY) missingVars.push('MCP_API_KEY');
+
+if (missingVars.length > 0) {
+  console.error('❌ Missing required environment variables:', missingVars.join(', '));
+  console.error('💡 Please set these in your Render.com environment settings');
+  throw new Error(`Missing required env vars: ${missingVars.join(', ')}`);
 }
+console.log('✅ All required environment variables found');
 
 // Resolve public base URL for links returned to clients
 const RESOLVED_BASE_URL = PUBLIC_BASE_URL || `https://chatgpt-mcp.onrender.com`;
@@ -145,29 +156,25 @@ const Graph = {
   },
 
   async tenantWideSearch(q: string, top = 25) {
-    console.log(`[Graph] Tenant-wide search: "${q}"`);
+    console.log(`[Graph] Attempting tenant-wide search: "${q}"`);
     
-    // Use Microsoft Search API for broader coverage
-    const searchBody = {
-      requests: [{
-        entityTypes: ["driveItem", "listItem"],
-        query: {
-          queryString: q
-        },
-        from: 0,
-        size: top,
-        fields: ["id", "name", "webUrl", "createdDateTime", "lastModifiedDateTime", "parentReference"]
-      }]
-    };
-
+    // Try Microsoft Search API first, but fallback immediately if not available
     try {
+      const searchBody = {
+        requests: [{
+          entityTypes: ["driveItem"],
+          query: { queryString: q },
+          from: 0,
+          size: top
+        }]
+      };
+
       const result = await g<any>('/search/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(searchBody)
       });
       
-      // Transform Microsoft Search results to match drive search format
       const hits = result?.value?.[0]?.hitsContainers?.[0]?.hits || [];
       const items = hits.map((hit: any) => ({
         id: hit.resource.id,
@@ -183,7 +190,7 @@ const Graph = {
       console.log(`[Graph] Tenant search "${q}" -> ${items.length} results`);
       return { value: items };
     } catch (e: any) {
-      console.log(`[Graph] Tenant search failed, falling back to drive search:`, e.message);
+      console.log(`[Graph] Tenant search not available (${e.message}), using drive search`);
       return this.driveSearch(q, top);
     }
   },
@@ -830,8 +837,21 @@ app.get('/mcp/help', (_req, res) => {
 });
 
 app.listen(Number(PORT), () => {
-  console.log(`MCP server on :${PORT} — scoped to ${FOLDER_ITEM_ID ? `folder ${FOLDER_ITEM_ID}` : 'drive root'}`);
-  console.log('Server expects batch requests: [initialize, method_call]');
-  console.log('Public base URL:', RESOLVED_BASE_URL);
-  console.log('See /mcp/help for usage examples');
+  console.log('🚀 MCP SharePoint Connector starting...');
+  console.log(`📡 Server running on port ${PORT}`);
+  console.log(`🔗 Public URL: ${RESOLVED_BASE_URL}`);
+  console.log(`📁 Drive ID: ${DRIVE_ID}`);
+  console.log(`📂 Folder scope: ${FOLDER_ITEM_ID ? `folder ${FOLDER_ITEM_ID}` : 'drive root'}`);
+  console.log(`🔑 Tenant: ${TENANT_ID}`);
+  console.log('');
+  console.log('Available endpoints:');
+  console.log('  🔍 GET  / - Health check');
+  console.log('  🤖 GET  /mcp/sse - ChatGPT connector SSE stream');
+  console.log('  🤖 POST /mcp/sse - ChatGPT connector MCP calls');
+  console.log('  📥 GET  /download/:id - File download proxy');
+  console.log('');
+  console.log('✅ Server ready for connections!');
+}).on('error', (err) => {
+  console.error('❌ Server failed to start:', err);
+  process.exit(1);
 });
