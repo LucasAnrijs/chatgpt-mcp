@@ -26,6 +26,11 @@ const RESOLVED_BASE_URL = PUBLIC_BASE_URL || `https://chatgpt-mcp.onrender.com`;
 // --- OAuth token cache ---
 let cachedToken: { token: string; exp: number } | null = null;
 
+// --- Query cache and deduplication ---
+const queryCache = new Map<string, { results: any[]; timestamp: number }>();
+const inFlightQueries = new Map<string, Promise<any>>();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
 async function getGraphToken(): Promise<string> {
   const now = Date.now() / 1000;
   if (cachedToken && cachedToken.exp - now > 60) return cachedToken.token;
@@ -50,25 +55,50 @@ async function getGraphToken(): Promise<string> {
   return cachedToken.token;
 }
 
-// --- Graph helper ---
-async function g<T>(path: string, init?: RequestInit & { raw?: boolean }): Promise<T> {
+// --- Graph helper with retry logic ---
+async function g<T>(path: string, init?: RequestInit & { raw?: boolean }, retries = 3): Promise<T> {
   const token = await getGraphToken();
   const fullPath = path.startsWith('/') ? path : `/${path}`;
   const url = `https://graph.microsoft.com/v1.0${fullPath}`;
-  console.log(`[Graph] Calling: ${url}`);
+  
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    console.log(`[Graph] Calling: ${url} (attempt ${attempt + 1})`);
+    
   const resp = await fetch(url, {
     ...init,
     headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(init?.headers || {}) },
   });
 
-  if (!resp.ok) {
+    if (resp.ok) {
+      if ((init as any)?.raw) return resp as any;
+      return resp.json() as Promise<T>;
+    }
+
+    // Handle rate limiting with proper Retry-After
+    if (resp.status === 429 && attempt < retries) {
+      const retryAfter = resp.headers.get('retry-after');
+      const delay = retryAfter 
+        ? parseInt(retryAfter) * 1000 
+        : Math.min(Math.pow(2, attempt) * 1000 + Math.random() * 1000, 30000); // Jitter + cap at 30s
+      console.log(`[Graph] Rate limited (429), retrying after ${delay}ms (attempt ${attempt + 1}/${retries})`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      continue;
+    }
+    
+    // Handle server errors
+    if (resp.status >= 500 && resp.status < 600 && attempt < retries) {
+      const delay = Math.min(Math.pow(2, attempt) * 1000 + Math.random() * 1000, 30000);
+      console.log(`[Graph] Server error (${resp.status}), retrying after ${delay}ms`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      continue;
+    }
+
     let errBody: any;
     try { errBody = await resp.json(); } catch { errBody = await resp.text(); }
     throw new Error(`Graph ${resp.status} ${resp.statusText}: ${typeof errBody === 'string' ? errBody : JSON.stringify(errBody)}`);
   }
 
-  if ((init as any)?.raw) return resp as any;
-  return resp.json() as Promise<T>;
+  throw new Error(`Graph request failed after ${retries + 1} attempts`);
 }
 
 // --- Optional folder scope ---
@@ -76,18 +106,102 @@ let SEARCH_ROOT_ITEM_ID: string | null = FOLDER_ITEM_ID || null;
 
 // --- Graph wrappers ---
 const Graph = {
-  async search(q: string, top = 20) {
+  async search(q: string, top = 25) {
+    // Normalize query for caching (lowercase, trim)
+    const normalizedQuery = q.toLowerCase().trim();
+    const cacheKey = `search:${normalizedQuery}:${top}`;
+    
+    // Check cache first
+    const cached = queryCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      console.log(`[Graph] Cache hit for "${normalizedQuery}"`);
+      return { value: cached.results };
+    }
+    
+    // Check for in-flight duplicate request
+    if (inFlightQueries.has(cacheKey)) {
+      console.log(`[Graph] Deduplicating query "${normalizedQuery}"`);
+      const result = await inFlightQueries.get(cacheKey)!;
+      return result;
+    }
+    
+    // Use tenant-wide search for broader coverage
+    const searchPromise = this.tenantWideSearch(normalizedQuery, top);
+    inFlightQueries.set(cacheKey, searchPromise);
+    
+    try {
+      const result = await searchPromise;
+      
+      // Cache successful results
+      queryCache.set(cacheKey, {
+        results: result.value || [],
+        timestamp: Date.now()
+      });
+      
+      return result;
+    } finally {
+      inFlightQueries.delete(cacheKey);
+    }
+  },
+
+  async tenantWideSearch(q: string, top = 25) {
+    console.log(`[Graph] Tenant-wide search: "${q}"`);
+    
+    // Use Microsoft Search API for broader coverage
+    const searchBody = {
+      requests: [{
+        entityTypes: ["driveItem", "listItem"],
+        query: {
+          queryString: q
+        },
+        from: 0,
+        size: top,
+        fields: ["id", "name", "webUrl", "createdDateTime", "lastModifiedDateTime", "parentReference"]
+      }]
+    };
+
+    try {
+      const result = await g<any>('/search/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(searchBody)
+      });
+      
+      // Transform Microsoft Search results to match drive search format
+      const hits = result?.value?.[0]?.hitsContainers?.[0]?.hits || [];
+      const items = hits.map((hit: any) => ({
+        id: hit.resource.id,
+        name: hit.resource.name,
+        webUrl: hit.resource.webUrl,
+        createdDateTime: hit.resource.createdDateTime,
+        lastModifiedDateTime: hit.resource.lastModifiedDateTime,
+        file: hit.resource.file,
+        size: hit.resource.size,
+        parentReference: hit.resource.parentReference
+      }));
+      
+      console.log(`[Graph] Tenant search "${q}" -> ${items.length} results`);
+      return { value: items };
+    } catch (e: any) {
+      console.log(`[Graph] Tenant search failed, falling back to drive search:`, e.message);
+      return this.driveSearch(q, top);
+    }
+  },
+
+  async driveSearch(q: string, top = 25) {
     const safe = q.replace(/'/g, "''");
     const base = SEARCH_ROOT_ITEM_ID
       ? `/drives/${DRIVE_ID}/items/${SEARCH_ROOT_ITEM_ID}/search(q='${safe}')`
       : `/drives/${DRIVE_ID}/root/search(q='${safe}')`;
     const url = `${base}?$top=${top}`;
-    console.log(`[Graph] Search URL: ${url}`);
+    console.log(`[Graph] Drive search URL: ${url}`);
     return g<any>(url);
   },
+
   async getItemById(itemId: string) {
     return g<any>(`/drives/${DRIVE_ID}/items/${itemId}`);
   },
+  
   async downloadById(itemId: string): Promise<globalThis.Response> {
     return g<globalThis.Response>(`/drives/${DRIVE_ID}/items/${itemId}/content`, { raw: true, method: 'GET' });
   },
@@ -115,7 +229,23 @@ const mcpTools = {
       return results;
     } catch (e: any) {
       console.error('[MCP] search error:', e);
-      return [];
+      
+      // Return user-friendly error for rate limiting
+      if (e.message?.includes('429') || e.message?.includes('throttled')) {
+        return [{
+          id: 'error-throttled',
+          title: 'Search Temporarily Limited',
+          text: 'Microsoft Graph is currently throttling requests. Please try again in a moment.',
+          url: ''
+        }];
+      }
+      
+      return [{
+        id: 'error-general',
+        title: 'Search Error',
+        text: `Search failed: ${e.message?.slice(0, 100) || 'Unknown error'}`,
+        url: ''
+      }];
     }
   },
 
@@ -518,6 +648,12 @@ app.post('/mcp/sse', async (req, res) => {
         },
         id,
       });
+    }
+    
+    if (method === 'notifications/initialized') {
+      // ChatGPT sends this after initialization - just acknowledge
+      console.log('[MCP-SSE] Client initialized notification received');
+      return res.status(204).send(); // No content response for notifications
     }
     
     if (method === 'tools/call') {
