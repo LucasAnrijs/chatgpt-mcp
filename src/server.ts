@@ -207,6 +207,7 @@ function auth(req: Request, res: Response, next: NextFunction) {
 app.use(auth);
 
 // MCP endpoint
+// MCP endpoint (no auto-init, single handleRequest)
 app.post('/mcp', async (req: Request, res: Response) => {
     try {
       const server = buildServer();
@@ -216,29 +217,8 @@ app.post('/mcp', async (req: Request, res: Response) => {
   
       await server.connect(transport);
   
-      const incoming = req.body;
-  
-      const hasInitialize =
-        (Array.isArray(incoming) && incoming.some((m: any) => m?.method === 'initialize')) ||
-        (!Array.isArray(incoming) && incoming?.method === 'initialize');
-  
-      // Build a single payload: [initialize, <original>] to keep the same response stream
-      const initFrame = {
-        jsonrpc: '2.0',
-        id: '__auto__',
-        method: 'initialize',
-        params: {
-          clientInfo: { name: 'auto-init', version: '1.0.0' },
-          protocolVersion: '2024-11-05',
-          capabilities: {},
-        },
-      };
-  
-      const payload = hasInitialize
-        ? incoming
-        : (Array.isArray(incoming) ? [initFrame, ...incoming] : [initFrame, incoming]);
-  
-      await transport.handleRequest(req, res, payload);
+      // IMPORTANT: exactly one call; client must send initialize in same request
+      await transport.handleRequest(req, res, req.body);
     } catch (err: any) {
       console.error(err);
       if (!res.headersSent) {
@@ -250,6 +230,7 @@ app.post('/mcp', async (req: Request, res: Response) => {
       }
     }
 });
+  
   
 
 app.listen(Number(PORT), () => {
