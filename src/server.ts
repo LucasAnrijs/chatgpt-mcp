@@ -179,22 +179,22 @@ app.get('/version', (_req, res) => {
 
 // Force sane headers for MCP requests (fix 406)
 app.use('/mcp', (req, _res, next) => {
-    // Log what actually arrives so we can verify
-    console.log('[MCP] incoming headers:', {
+    // Helpful one-line log
+    console.log('[MCP] incoming', {
       accept: req.headers.accept,
-      contentType: req.headers['content-type'],
-      auth: (req.headers.authorization || '').slice(0, 16) + (req.headers.authorization ? '…' : '')
+      type: req.headers['content-type'],
     });
   
-    // Enforce what the MCP transport expects
-    if (!req.headers.accept || req.headers.accept === '*/*') {
-      req.headers.accept = 'application/json';
-    }
+    // Ensure the MCP transport-required Accept is present
+    req.headers.accept = 'application/json, text/event-stream';
+  
+    // Ensure Content-Type when a body is posted
     if (!req.headers['content-type']) {
       req.headers['content-type'] = 'application/json';
     }
     next();
 });
+  
   
   
 // Auth AFTER public routes (so /health is open)
@@ -214,33 +214,31 @@ app.post('/mcp', async (req: Request, res: Response) => {
         sessionIdGenerator: () => Math.random().toString(36).slice(2),
       });
   
-      // Connect the transport
       await server.connect(transport);
   
-      // Decide if we need to auto-initialize
-      const body = req.body;
+      const incoming = req.body;
+  
       const hasInitialize =
-        (Array.isArray(body) && body.some((m) => m?.method === 'initialize')) ||
-        (body && body.method === 'initialize');
+        (Array.isArray(incoming) && incoming.some((m: any) => m?.method === 'initialize')) ||
+        (!Array.isArray(incoming) && incoming?.method === 'initialize');
   
-      if (!hasInitialize) {
-        // Send an initialize frame first so subsequent frames work
-        const initFrame = {
-          jsonrpc: '2.0',
-          id: '__auto__',
-          method: 'initialize',
-          params: {
-            clientInfo: { name: 'auto-init', version: '1.0.0' },
-            protocolVersion: '2024-11-05',
-            capabilities: {},
-          },
-        };
-        // Emit initialize BEFORE handling the incoming request
-        await transport.handleRequest(req, res, initFrame);
-      }
+      // Build a single payload: [initialize, <original>] to keep the same response stream
+      const initFrame = {
+        jsonrpc: '2.0',
+        id: '__auto__',
+        method: 'initialize',
+        params: {
+          clientInfo: { name: 'auto-init', version: '1.0.0' },
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+        },
+      };
   
-      // Now handle the original request (tools/list, tools/call, or batch)
-      await transport.handleRequest(req, res, body);
+      const payload = hasInitialize
+        ? incoming
+        : (Array.isArray(incoming) ? [initFrame, ...incoming] : [initFrame, incoming]);
+  
+      await transport.handleRequest(req, res, payload);
     } catch (err: any) {
       console.error(err);
       if (!res.headersSent) {
