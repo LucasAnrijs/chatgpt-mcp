@@ -82,6 +82,63 @@ const Graph = {
   },
 };
 
+// --- Store tool handlers separately for manual access ---
+const toolHandlers: Record<string, (args: any) => Promise<any>> = {
+  search: async ({ query, top }) => {
+    const res = await Graph.search(query, top ?? 20);
+    const items = res?.value ?? [];
+
+    const links = items.map((it: any) => ({
+      type: 'resource_link' as const,
+      uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${it.id}/content`,
+      name: it.name,
+      mimeType: it.file?.mimeType,
+      description: `driveItem ${it.id}`,
+    }));
+
+    return {
+      content: [
+        { type: 'text', text: `Found ${items.length} item(s). Showing up to ${top ?? 20}.` },
+        ...links,
+      ],
+    };
+  },
+  
+  fetch: async ({ id }) => {
+    const meta = await Graph.getItemById(id);
+    if (!meta.file) return { content: [{ type: 'text', text: `Not a file: ${meta.name || id}` }] };
+
+    const size = meta.size as number;
+    const mime = meta.file.mimeType as string | undefined;
+    const isText = mime?.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript'].includes(mime || '');
+    const under1MB = typeof size === 'number' ? size < 1_000_000 : false;
+
+    if (isText && under1MB) {
+      const resp = await Graph.downloadById(id);
+      const text = await resp.text();
+      return {
+        content: [
+          { type: 'text', text: `# ${meta.name}\n(mime: ${mime}, size: ${size}B)` },
+          { type: 'text', text },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        { type: 'text', text: `Large/binary file. Returning link.\n(mime: ${mime}, size: ${size}B)` },
+        {
+          type: 'resource_link',
+          uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${id}/content`,
+          name: meta.name,
+          mimeType: mime,
+          description: `Download ${meta.name}`,
+        },
+      ],
+    };
+  },
+};
+
 // --- Express wiring ---
 const app = express();
 app.use(express.json());
@@ -102,98 +159,20 @@ function auth(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
-// IMPORTANT: Use a custom transport implementation to handle batch requests
-// This bypasses the StreamableHTTPServerTransport entirely
+// MCP endpoint - Handle batch requests with manual JSON-RPC processing
 app.post('/mcp', auth, async (req: Request, res: Response) => {
   try {
     console.log('[MCP] Processing request');
     
-    // Build a fresh server for each request
-    const server = new McpServer({ name: 'sharepoint-drive-connector', version: '1.1.1' });
-    
-    // Register tools
-    server.registerTool(
-      'search',
-      {
-        title: 'Search SharePoint drive',
-        description: SEARCH_ROOT_ITEM_ID
-          ? 'Search within the specified folder only'
-          : 'Search the entire document library (drive root)',
-        inputSchema: {
-          query: z.string().min(1),
-          top: z.number().int().min(1).max(50).optional(),
-        },
-      },
-      async ({ query, top }) => {
-        const res = await Graph.search(query, top ?? 20);
-        const items = res?.value ?? [];
-
-        const links = items.map((it: any) => ({
-          type: 'resource_link' as const,
-          uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${it.id}/content`,
-          name: it.name,
-          mimeType: it.file?.mimeType,
-          description: `driveItem ${it.id}`,
-        }));
-
-        return {
-          content: [
-            { type: 'text', text: `Found ${items.length} item(s). Showing up to ${top ?? 20}.` },
-            ...links,
-          ],
-        };
-      }
-    );
-
-    server.registerTool(
-      'fetch',
-      {
-        title: 'Fetch a file by item id',
-        description: 'Return file content inline (if text & small), else a download link',
-        inputSchema: { id: z.string().min(1) },
-      },
-      async ({ id }) => {
-        const meta = await Graph.getItemById(id);
-        if (!meta.file) return { content: [{ type: 'text', text: `Not a file: ${meta.name || id}` }] };
-
-        const size = meta.size as number;
-        const mime = meta.file.mimeType as string | undefined;
-        const isText = mime?.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript'].includes(mime || '');
-        const under1MB = typeof size === 'number' ? size < 1_000_000 : false;
-
-        if (isText && under1MB) {
-          const resp = await Graph.downloadById(id);
-          const text = await resp.text();
-          return {
-            content: [
-              { type: 'text', text: `# ${meta.name}\n(mime: ${mime}, size: ${size}B)` },
-              { type: 'text', text },
-            ],
-          };
-        }
-
-        return {
-          content: [
-            { type: 'text', text: `Large/binary file. Returning link.\n(mime: ${mime}, size: ${size}B)` },
-            {
-              type: 'resource_link',
-              uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${id}/content`,
-              name: meta.name,
-              mimeType: mime,
-              description: `Download ${meta.name}`,
-            },
-          ],
-        };
-      }
-    );
-
-    // Manually handle the JSON-RPC batch request
+    // Handle both single and batch requests
     const requests = Array.isArray(req.body) ? req.body : [req.body];
     const responses: any[] = [];
     
     let initialized = false;
     
     for (const request of requests) {
+      console.log(`[MCP] Processing method: ${request.method}`);
+      
       if (request.method === 'initialize') {
         // Handle initialization
         if (initialized) {
@@ -270,19 +249,20 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
         } else {
           try {
             const { name, arguments: args } = request.params;
+            console.log(`[MCP] Calling tool: ${name} with args:`, args);
             
-            // Get the tool handler directly
-            const tools = (server as any)._tools as Map<string, any>;
-            const tool = tools.get(name);
+            // Get the tool handler
+            const handler = toolHandlers[name];
             
-            if (!tool) {
+            if (!handler) {
               responses.push({
                 jsonrpc: '2.0',
                 error: { code: -32601, message: `Tool not found: ${name}` },
                 id: request.id,
               });
             } else {
-              const result = await tool.handler(args);
+              // Execute the tool
+              const result = await handler(args);
               responses.push({
                 jsonrpc: '2.0',
                 result,
@@ -290,6 +270,7 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
               });
             }
           } catch (err: any) {
+            console.error(`[MCP] Tool execution error:`, err);
             responses.push({
               jsonrpc: '2.0',
               error: { code: -32603, message: err.message },
@@ -307,7 +288,7 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
       }
     }
     
-    // Send response
+    // Send response - match the input format
     if (Array.isArray(req.body)) {
       res.json(responses);
     } else {
@@ -324,7 +305,64 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
   }
 });
 
+// Help endpoint
+app.get('/mcp/help', (_req, res) => {
+  res.json({
+    usage: 'Send batch requests with initialization + method call',
+    example: {
+      endpoint: 'POST /mcp',
+      headers: {
+        'Authorization': 'Bearer YOUR_API_KEY',
+        'Accept': 'application/json, text/event-stream',
+        'Content-Type': 'application/json',
+      },
+      body: [
+        {
+          jsonrpc: '2.0',
+          id: '0',
+          method: 'initialize',
+          params: {
+            clientInfo: { name: 'your-client', version: '1.0.0' },
+            protocolVersion: '2024-11-05',
+            capabilities: {},
+          },
+        },
+        {
+          jsonrpc: '2.0',
+          id: '1',
+          method: 'tools/call',
+          params: {
+            name: 'search',
+            arguments: {
+              query: 'your search query',
+              top: 10,
+            },
+          },
+        },
+      ],
+    },
+    availableTools: [
+      {
+        name: 'search',
+        description: 'Search SharePoint drive',
+        parameters: {
+          query: 'Search query (required)',
+          top: 'Number of results (optional, max 50)',
+        },
+      },
+      {
+        name: 'fetch',
+        description: 'Fetch a file by item id',
+        parameters: {
+          id: 'SharePoint item ID (required)',
+        },
+      },
+    ],
+  });
+});
+
 app.listen(Number(PORT), () => {
   console.log(`MCP server on :${PORT} — scoped to ${FOLDER_ITEM_ID ? `folder ${FOLDER_ITEM_ID}` : 'drive root'}`);
   console.log('Server expects batch requests: [initialize, method_call]');
+  console.log('See /mcp/help for usage examples');
 });
