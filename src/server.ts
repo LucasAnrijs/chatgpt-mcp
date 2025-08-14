@@ -96,19 +96,26 @@ const Graph = {
 const toolHandlers: Record<string, (args: any) => Promise<any>> = {
   // Return stable IDs via structuredContent; no Graph URLs here
   search: async ({ query, top }) => {
-    const res = await Graph.search(query, top ?? 20);
-    const items = (res?.value ?? []).map((it: any) => ({
-      id: it.id,
-      name: it.name,
-      mimeType: it.file?.mimeType,
-    }));
-
-    return {
-      content: [
-        { type: 'text', text: `Found ${items.length} item(s).` },
-      ],
-      structuredContent: { items },
-    };
+    console.log('[DEBUG] search tool invoked', { query, top });
+    try {
+      const res = await Graph.search(query, top ?? 20);
+      console.log('[DEBUG] Graph.search returned', res?.value?.length);
+      const items = (res?.value ?? []).map((it: any) => ({
+        id: it.id,
+        name: it.name,
+        mimeType: it.file?.mimeType,
+      }));
+      return {
+        content: [{ type: 'text', text: `Found ${items.length} item(s).` }],
+        structuredContent: { items },
+      };
+    } catch (e: any) {
+      console.error('[ERROR] search tool failed', e);
+      return {
+        content: [{ type: 'text', text: `Search failed: ${e?.message || e}` }],
+        structuredContent: { items: [] },
+      };
+    }
   },
 
   // Accept either { id } or { ids: string[] }
@@ -121,34 +128,37 @@ const toolHandlers: Record<string, (args: any) => Promise<any>> = {
     const content: any[] = [];
 
     for (const curId of targetIds) {
-      const meta = await Graph.getItemById(curId);
-      if (!meta.file) {
-        content.push({ type: 'text', text: `Not a file: ${meta.name || curId}` });
-        continue;
-      }
+      try {
+        const meta = await Graph.getItemById(curId);
+        if (!meta.file) {
+          content.push({ type: 'text', text: `Not a file: ${meta.name || curId}` });
+          continue;
+        }
 
-      const size = meta.size as number;
-      const mime = meta.file.mimeType as string | undefined;
-      const isText = !!(mime && (mime.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript'].includes(mime)));
-      const under1MB = typeof size === 'number' ? size < 1_000_000 : false;
+        const size = meta.size as number;
+        const mime = meta.file.mimeType as string | undefined;
+        const isText = !!(mime && (mime.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript'].includes(mime)));
+        const under1MB = typeof size === 'number' ? size < 1_000_000 : false;
 
-      if (isText && under1MB) {
-        const resp = await Graph.downloadById(curId);
-        const text = await resp.text();
-        content.push({ type: 'text', text: `# ${meta.name}\n(mime: ${mime}, size: ${size}B)` });
-        content.push({ type: 'text', text });
-        // Also embed as a resource for clients that prefer resources
-        content.push({ type: 'resource', resource: { uri: `sp://${curId}`, title: meta.name, mimeType: mime, text } });
-      } else {
-        // Provide a proxy link on OUR domain so the client doesn't need Graph auth
-        content.push({ type: 'text', text: `Large/binary file: ${meta.name} (mime: ${mime}, size: ${size}B)` });
-        content.push({
-          type: 'resource_link',
-          uri: `${RESOLVED_BASE_URL}/download/${curId}`,
-          name: meta.name,
-          mimeType: mime,
-          description: `Download ${meta.name}`,
-        });
+        if (isText && under1MB) {
+          const resp = await Graph.downloadById(curId);
+          const text = await resp.text();
+          content.push({ type: 'text', text: `# ${meta.name}\n(mime: ${mime}, size: ${size}B)` });
+          content.push({ type: 'text', text });
+          content.push({ type: 'resource', resource: { uri: `sp://${curId}`, title: meta.name, mimeType: mime, text } });
+        } else {
+          content.push({ type: 'text', text: `Large/binary file: ${meta.name} (mime: ${mime}, size: ${size}B)` });
+          content.push({
+            type: 'resource_link',
+            uri: `${RESOLVED_BASE_URL}/download/${curId}`,
+            name: meta.name,
+            mimeType: mime,
+            description: `Download ${meta.name}`,
+          });
+        }
+      } catch (e: any) {
+        console.error(`[ERROR] fetch failed for ${curId}`, e);
+        content.push({ type: 'text', text: `Fetch failed for ${curId}: ${e?.message || e}` });
       }
     }
 
@@ -158,7 +168,7 @@ const toolHandlers: Record<string, (args: any) => Promise<any>> = {
 
 // --- Express wiring ---
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 app.use(cors({
   origin: ['https://chat.openai.com', 'https://chatgpt.com'],
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -372,6 +382,7 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
               });
             } else {
               const result = await handler(args);
+              console.log(`[MCP] tools/call handler result for ${name}:`, JSON.stringify(result, null, 2));
               responses.push({ jsonrpc: '2.0', result, id: request.id });
             }
           } catch (err: any) {
