@@ -128,7 +128,7 @@ const mcpTools = {
 
       const meta = await Graph.getItemById(id);
       if (!meta.file) {
-        return { 
+        return {
           id, 
           title: `${meta.name || id} (not a file)`, 
           text: 'Not a file', 
@@ -463,66 +463,106 @@ app.get('/mcp/sse', (req, res) => {
 
 app.post('/mcp/sse', async (req, res) => {
   try {
-    console.log('[FastMCP] Request:', JSON.stringify(req.body, null, 2));
+    console.log('[MCP-SSE] Request:', JSON.stringify(req.body, null, 2));
     
-    const { method, params = {} } = req.body;
+    const { jsonrpc, method, params = {}, id } = req.body;
     
-    if (method === 'ping') {
-      return res.json({ type: 'pong' });
+    // Handle JSON-RPC 2.0 MCP protocol
+    if (method === 'initialize') {
+      const requested = params?.protocolVersion;
+      const supported = new Set(['2024-11-05', '2025-03-26', '2025-06-18']);
+      const chosen = requested && supported.has(requested) ? requested : '2025-06-18';
+      
+      return res.json({
+        jsonrpc: '2.0',
+        result: {
+          protocolVersion: chosen,
+          capabilities: {
+            tools: { listChanged: true },
+            resources: { listChanged: false, subscribe: false },
+          },
+          serverInfo: { name: 'sharepoint-drive-connector', version: '1.2.0' },
+        },
+        id,
+      });
     }
     
     if (method === 'tools/list') {
       return res.json({
-        tools: [
-          {
-            name: 'search',
-            description: 'Search SharePoint documents',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                query: { type: 'string', description: 'Search query' }
-              },
-              required: ['query']
+        jsonrpc: '2.0',
+        result: {
+          tools: [
+            {
+              name: 'search',
+              description: 'Search SharePoint documents',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  query: { type: 'string', description: 'Search query' }
+                },
+                required: ['query']
+              }
+            },
+            {
+              name: 'fetch', 
+              description: 'Fetch document by ID',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string', description: 'Document ID' }
+                },
+                required: ['id']
+              }
             }
-          },
-          {
-            name: 'fetch', 
-            description: 'Fetch document by ID',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                id: { type: 'string', description: 'Document ID' }
-              },
-              required: ['id']
-            }
-          }
-        ]
+          ]
+        },
+        id,
       });
     }
     
     if (method === 'tools/call') {
       const { name, arguments: args } = params;
-      console.log(`[FastMCP] Tool call: ${name}`, args);
+      console.log(`[MCP-SSE] Tool call: ${name}`, args);
       
       if (name === 'search') {
         const results = await mcpTools.search(args?.query || '');
-        console.log(`[FastMCP] Search results: ${results.length} items`);
-        return res.json(results);
+        console.log(`[MCP-SSE] Search results: ${results.length} items`);
+        return res.json({
+          jsonrpc: '2.0',
+          result: { content: [{ type: 'text', text: `Found ${results.length} results` }], structuredContent: { items: results } },
+          id,
+        });
       }
       
       if (name === 'fetch') {
         const result = await mcpTools.fetch(args?.id || '');
-        console.log(`[FastMCP] Fetch result:`, result.title);
-        return res.json(result);
+        console.log(`[MCP-SSE] Fetch result:`, result.title);
+        return res.json({
+          jsonrpc: '2.0',
+          result: { content: [{ type: 'text', text: result.text }] },
+          id,
+        });
       }
       
-      return res.status(400).json({ error: `Unknown tool: ${name}` });
+      return res.json({
+        jsonrpc: '2.0',
+        error: { code: -32601, message: `Tool not found: ${name}` },
+        id,
+      });
     }
     
-    return res.status(400).json({ error: `Unknown method: ${method}` });
+    return res.json({
+      jsonrpc: '2.0',
+      error: { code: -32601, message: `Method not found: ${method}` },
+      id,
+    });
   } catch (err: any) {
-    console.error('[FastMCP] Error:', err);
-    return res.status(500).json({ error: err.message, stack: err.stack });
+    console.error('[MCP-SSE] Error:', err);
+    return res.json({
+      jsonrpc: '2.0',
+      error: { code: -32603, message: err.message },
+      id: req.body?.id || null,
+    });
   }
 });
 
