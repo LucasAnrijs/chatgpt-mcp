@@ -179,12 +179,23 @@ app.get('/version', (_req, res) => {
 
 // Force sane headers for MCP requests (fix 406)
 app.use('/mcp', (req, _res, next) => {
-    // Some clients send */* or nothing; make it explicit
-    req.headers.accept = 'application/json';
-    // PowerShell sometimes omits Content-Type even when a body is present
-    if (!req.headers['content-type']) req.headers['content-type'] = 'application/json';
+    // Log what actually arrives so we can verify
+    console.log('[MCP] incoming headers:', {
+      accept: req.headers.accept,
+      contentType: req.headers['content-type'],
+      auth: (req.headers.authorization || '').slice(0, 16) + (req.headers.authorization ? '…' : '')
+    });
+  
+    // Enforce what the MCP transport expects
+    if (!req.headers.accept || req.headers.accept === '*/*') {
+      req.headers.accept = 'application/json';
+    }
+    if (!req.headers['content-type']) {
+      req.headers['content-type'] = 'application/json';
+    }
     next();
 });
+  
   
 // Auth AFTER public routes (so /health is open)
 function auth(req: Request, res: Response, next: NextFunction) {
