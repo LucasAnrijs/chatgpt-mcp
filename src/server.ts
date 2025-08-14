@@ -1,8 +1,6 @@
 import 'dotenv/config';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import cors from 'cors';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { z } from 'zod';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 const {
@@ -14,11 +12,15 @@ const {
   FOLDER_ITEM_ID, // optional
   MCP_API_KEY,
   OAUTH_AUDIENCE, // optional override (defaults to CLIENT_ID)
+  PUBLIC_BASE_URL, // optional; used for absolute download links
 } = process.env;
 
 if (!TENANT_ID || !CLIENT_ID || !CLIENT_SECRET || !DRIVE_ID || !MCP_API_KEY) {
   throw new Error('Missing required env vars (TENANT_ID, CLIENT_ID, CLIENT_SECRET, DRIVE_ID, MCP_API_KEY)');
 }
+
+// Resolve public base URL for links returned to clients
+const RESOLVED_BASE_URL = PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 
 // --- OAuth token cache ---
 let cachedToken: { token: string; exp: number } | null = null;
@@ -50,11 +52,9 @@ async function getGraphToken(): Promise<string> {
 // --- Graph helper ---
 async function g<T>(path: string, init?: RequestInit & { raw?: boolean }): Promise<T> {
   const token = await getGraphToken();
-  // Fix: Ensure path starts with / and construct full URL properly
   const fullPath = path.startsWith('/') ? path : `/${path}`;
   const url = `https://graph.microsoft.com/v1.0${fullPath}`;
   console.log(`[Graph] Calling: ${url}`);
-  
   const resp = await fetch(url, {
     ...init,
     headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(init?.headers || {}) },
@@ -76,7 +76,6 @@ let SEARCH_ROOT_ITEM_ID: string | null = FOLDER_ITEM_ID || null;
 // --- Graph wrappers ---
 const Graph = {
   async search(q: string, top = 20) {
-    // Escape single quotes per OData specification
     const safe = q.replace(/'/g, "''");
     const base = SEARCH_ROOT_ITEM_ID
       ? `/drives/${DRIVE_ID}/items/${SEARCH_ROOT_ITEM_ID}/search(q='${safe}')`
@@ -93,70 +92,78 @@ const Graph = {
   },
 };
 
-// --- Store tool handlers separately for manual access ---
+// --- Tool handlers (MCP) ---
 const toolHandlers: Record<string, (args: any) => Promise<any>> = {
+  // Return stable IDs via structuredContent; no Graph URLs here
   search: async ({ query, top }) => {
-      const res = await Graph.search(query, top ?? 20);
-      const items = res?.value ?? [];
+    const res = await Graph.search(query, top ?? 20);
+    const items = (res?.value ?? []).map((it: any) => ({
+      id: it.id,
+      name: it.name,
+      mimeType: it.file?.mimeType,
+    }));
 
-      const links = items.map((it: any) => ({
-        type: 'resource_link' as const,
-        uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${it.id}/content`,
-        name: it.name,
-        mimeType: it.file?.mimeType,
-        description: `driveItem ${it.id}`,
-      }));
-
-      return {
-        content: [
-          { type: 'text', text: `Found ${items.length} item(s). Showing up to ${top ?? 20}.` },
-          ...links,
-        ],
-      };
+    return {
+      content: [
+        { type: 'text', text: `Found ${items.length} item(s).` },
+      ],
+      structuredContent: { items },
+    };
   },
-  
-  fetch: async ({ id }) => {
-      const meta = await Graph.getItemById(id);
-      if (!meta.file) return { content: [{ type: 'text', text: `Not a file: ${meta.name || id}` }] };
+
+  // Accept either { id } or { ids: string[] }
+  fetch: async ({ id, ids }: { id?: string; ids?: string[] }) => {
+    const targetIds = (Array.isArray(ids) && ids.length > 0) ? ids : (id ? [id] : []);
+    if (targetIds.length === 0) {
+      return { content: [{ type: 'text', text: 'No id(s) provided' }] };
+    }
+
+    const content: any[] = [];
+
+    for (const curId of targetIds) {
+      const meta = await Graph.getItemById(curId);
+      if (!meta.file) {
+        content.push({ type: 'text', text: `Not a file: ${meta.name || curId}` });
+        continue;
+      }
 
       const size = meta.size as number;
       const mime = meta.file.mimeType as string | undefined;
-      const isText = mime?.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript'].includes(mime || '');
-    const under1MB = typeof size === 'number' ? size < 1_000_000 : false;
+      const isText = !!(mime && (mime.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript'].includes(mime)));
+      const under1MB = typeof size === 'number' ? size < 1_000_000 : false;
 
       if (isText && under1MB) {
-        const resp = await Graph.downloadById(id);
+        const resp = await Graph.downloadById(curId);
         const text = await resp.text();
-        return {
-          content: [
-            { type: 'text', text: `# ${meta.name}\n(mime: ${mime}, size: ${size}B)` },
-            { type: 'text', text },
-          ],
-        };
-      }
-
-      return {
-        content: [
-          { type: 'text', text: `Large/binary file. Returning link.\n(mime: ${mime}, size: ${size}B)` },
-          {
-            type: 'resource_link',
-            uri: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${id}/content`,
-            name: meta.name,
-            mimeType: mime,
+        content.push({ type: 'text', text: `# ${meta.name}\n(mime: ${mime}, size: ${size}B)` });
+        content.push({ type: 'text', text });
+        // Also embed as a resource for clients that prefer resources
+        content.push({ type: 'resource', resource: { uri: `sp://${curId}`, title: meta.name, mimeType: mime, text } });
+      } else {
+        // Provide a proxy link on OUR domain so the client doesn't need Graph auth
+        content.push({ type: 'text', text: `Large/binary file: ${meta.name} (mime: ${mime}, size: ${size}B)` });
+        content.push({
+          type: 'resource_link',
+          uri: `${RESOLVED_BASE_URL}/download/${curId}`,
+          name: meta.name,
+          mimeType: mime,
           description: `Download ${meta.name}`,
-          },
-        ],
-      };
+        });
+      }
+    }
+
+    return { content };
   },
 };
 
 // --- Express wiring ---
 const app = express();
 app.use(express.json());
-app.use(cors({ 
+app.use(cors({
   origin: ['https://chat.openai.com', 'https://chatgpt.com'],
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Authorization', 'Content-Type', 'Accept']
+  allowedHeaders: ['Authorization', 'Content-Type', 'Accept', 'MCP-Protocol-Version', 'Origin'],
+  exposedHeaders: ['WWW-Authenticate'],
 }));
 
 // PUBLIC endpoints (mount BEFORE auth)
@@ -169,9 +176,10 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/version', (_req, res) => {
-  res.json({ name: 'sharepoint-drive-connector', version: '1.1.1' });
+  res.json({ name: 'sharepoint-drive-connector', version: '1.2.0' });
 });
 
+// OAuth Authorization Server metadata (kept for completeness)
 app.get('/.well-known/oauth-authorization-server', (_req, res) => {
   const base = `https://login.microsoftonline.com/${TENANT_ID}`;
   res.json({
@@ -180,161 +188,32 @@ app.get('/.well-known/oauth-authorization-server', (_req, res) => {
     token_endpoint: `${base}/oauth2/v2.0/token`,
     jwks_uri: `${base}/discovery/v2.0/keys`,
     token_endpoint_auth_methods_supported: [
-      "client_secret_post", 
-      "client_secret_basic"
-    ]
+      'client_secret_post',
+      'client_secret_basic',
+    ],
   });
 });
 
-app.get('/.well-known/ai-plugin.json', (req, res) => {
+// OAuth Protected Resource Metadata (RFC 9728) — consulted by MCP clients
+app.get('/.well-known/oauth-protected-resource', (req, res) => {
+  const resource = OAUTH_AUDIENCE || CLIENT_ID!; // expected audience your server validates
   res.json({
-    schema_version: "v1",
-    name_for_human: "SharePoint Knowledge Base",
-    name_for_model: "sharepoint_kb",
-    description_for_human: "Search and retrieve files from SharePoint document library",
-    description_for_model: "Search for documents in a SharePoint library using keywords and fetch file contents by ID",
-    auth: {
-      type: "oauth",
-      client_url: `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/authorize`,
-      scope: "https://graph.microsoft.com/.default",
-      authorization_url: `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
-      authorization_content_type: "application/x-www-form-urlencoded",
-      verification_tokens: {
-        openai: process.env.OPENAI_VERIFICATION_TOKEN || "verification-token"
-      }
-    },
-    api: {
-      type: "openapi",
-      url: `${req.protocol}://${req.get('host')}/openapi.json`
-    },
-    logo_url: "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e1/Microsoft_Office_SharePoint_%282019%E2%80%93present%29.svg/512px-Microsoft_Office_SharePoint_%282019%E2%80%93present%29.svg.png",
-    contact_email: "support@example.com",
-    legal_info_url: "https://example.com/legal"
+    resource,
+    authorization_servers: [
+      `https://login.microsoftonline.com/${TENANT_ID}/v2.0`,
+    ],
+    bearer_methods_supported: ['header'],
+    scopes_supported: ['mcp:tools:search', 'mcp:tools:fetch'],
+    resource_documentation: `${RESOLVED_BASE_URL}/docs`,
   });
 });
 
-app.get('/openapi.json', (req, res) => {
-  const baseUrl = `${req.protocol}://${req.get('host')}`;
-  res.json({
-    openapi: "3.0.1",
-    info: {
-      title: "SharePoint Knowledge Base API",
-      description: "Search and retrieve files from SharePoint document library",
-      version: "1.1.1"
-    },
-    servers: [{ url: baseUrl }],
-    components: {
-      securitySchemes: {
-        OAuth2: {
-          type: "oauth2",
-          flows: {
-            clientCredentials: {
-              tokenUrl: `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
-              scopes: {
-                "https://graph.microsoft.com/.default": "Access Microsoft Graph"
-              }
-            }
-          }
-        }
-      }
-    },
-    security: [{ OAuth2: ["https://graph.microsoft.com/.default"] }],
-    paths: {
-      "/tools/search": {
-        post: {
-          operationId: "searchDocuments",
-          summary: "Search for documents",
-          description: "Search for documents in the SharePoint library using keywords",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    q: {
-                      type: "string",
-                      description: "Search query"
-                    }
-                  },
-                  required: ["q"]
-                }
-              }
-            }
-          },
-          responses: {
-            "200": {
-              description: "Search results",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      results: {
-                        type: "array",
-                        items: {
-                          type: "object",
-                          properties: {
-                            id: { type: "string" },
-                            name: { type: "string" },
-                            webUrl: { type: "string" },
-                            mimeType: { type: "string" },
-                            size: { type: "number" },
-                            lastModified: { type: "string" },
-                            downloadUrl: { type: "string" }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-      "/tools/fetch": {
-        post: {
-          operationId: "fetchDocument",
-          summary: "Download a document",
-          description: "Download a document by its SharePoint item ID",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    id: {
-                      type: "string",
-                      description: "SharePoint item ID"
-                    }
-                  },
-                  required: ["id"]
-                }
-              }
-            }
-          },
-          responses: {
-            "200": {
-              description: "File content",
-              content: {
-                "application/octet-stream": {
-                  schema: {
-                    type: "string",
-                    format: "binary"
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  });
+// Optional: simple docs placeholder
+app.get('/docs', (_req, res) => {
+  res.type('text/plain').send('SharePoint MCP Connector: implements /mcp with tools search+fetch.');
 });
 
-// Auth middleware
+// Auth middleware for MCP endpoint
 const jwks = createRemoteJWKSet(new URL(`https://login.microsoftonline.com/${TENANT_ID}/discovery/v2.0/keys`));
 const acceptedIssuers = [
   `https://login.microsoftonline.com/${TENANT_ID}/v2.0`,
@@ -346,7 +225,12 @@ async function auth(req: Request, res: Response, next: NextFunction) {
   try {
     const hdr = req.header('authorization') || '';
     const bearer = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
-    if (!bearer) return res.status(401).json({ error: 'Missing Authorization header' });
+    if (!bearer) {
+      return res
+        .status(401)
+        .set('WWW-Authenticate', `Bearer resource_metadata="${RESOLVED_BASE_URL}/.well-known/oauth-protected-resource"`)
+        .json({ error: 'Missing Authorization header' });
+    }
 
     // Back-compat: allow static key as bearer
     if (bearer === MCP_API_KEY) return next();
@@ -357,11 +241,13 @@ async function auth(req: Request, res: Response, next: NextFunction) {
       audience: expectedAudience,
     });
 
-    // Optional: basic scope/role hint logging
     (req as any).oauth = { sub: payload.sub, appid: (payload as any).appid, roles: (payload as any).roles };
     return next();
   } catch (err: any) {
-    return res.status(401).json({ error: 'Unauthorized', details: err?.message });
+    return res
+      .status(401)
+      .set('WWW-Authenticate', `Bearer resource_metadata="${RESOLVED_BASE_URL}/.well-known/oauth-protected-resource"`)
+      .json({ error: 'Unauthorized', details: err?.message });
   }
 }
 
@@ -369,18 +255,16 @@ async function auth(req: Request, res: Response, next: NextFunction) {
 app.post('/mcp', auth, async (req: Request, res: Response) => {
   try {
     console.log('[MCP] Processing request');
-    
-    // Handle both single and batch requests
+
     const requests = Array.isArray(req.body) ? req.body : [req.body];
     const responses: any[] = [];
-    
+
     let initialized = false;
-    
+
     for (const request of requests) {
       console.log(`[MCP] Processing method: ${request.method}`);
-      
+
       if (request.method === 'initialize') {
-        // Handle initialization
         if (initialized) {
           responses.push({
             jsonrpc: '2.0',
@@ -389,18 +273,24 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
           });
         } else {
           initialized = true;
+          const requested: string | undefined = request?.params?.protocolVersion;
+          const supported = new Set(['2024-11-05', '2025-03-26', '2025-06-18']);
+          const chosen = requested && supported.has(requested) ? requested : '2025-06-18';
+
           responses.push({
             jsonrpc: '2.0',
             result: {
-              protocolVersion: '2024-11-05',
-              capabilities: { tools: { listChanged: true } },
-              serverInfo: { name: 'sharepoint-drive-connector', version: '1.1.1' },
+              protocolVersion: chosen,
+              capabilities: {
+                tools: { listChanged: true },
+                resources: { listChanged: false, subscribe: false },
+              },
+              serverInfo: { name: 'sharepoint-drive-connector', version: '1.2.0' },
             },
             id: request.id,
           });
         }
       } else if (request.method === 'tools/list') {
-        // Handle tools list
         if (!initialized) {
           responses.push({
             jsonrpc: '2.0',
@@ -422,21 +312,39 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
                     type: 'object',
                     properties: {
                       query: { type: 'string', minLength: 1 },
-                      top: { type: 'number', minimum: 1, maximum: 50 },
+                      top: { type: 'integer', minimum: 1, maximum: 50 },
                     },
                     required: ['query'],
+                  },
+                  outputSchema: {
+                    type: 'object',
+                    properties: {
+                      items: {
+                        type: 'array',
+                        items: {
+                          type: 'object',
+                          properties: {
+                            id: { type: 'string' },
+                            name: { type: 'string' },
+                            mimeType: { type: 'string' },
+                          },
+                          required: ['id', 'name'],
+                        },
+                      },
+                    },
+                    required: ['items'],
                   },
                 },
                 {
                   name: 'fetch',
-                  title: 'Fetch a file by item id',
-                  description: 'Return file content inline (if text & small), else a download link',
+                  title: 'Fetch file(s) by item id',
+                  description: 'Return inline content for small text; otherwise a proxy download link',
                   inputSchema: {
                     type: 'object',
                     properties: {
                       id: { type: 'string', minLength: 1 },
+                      ids: { type: 'array', items: { type: 'string', minLength: 1 } },
                     },
-                    required: ['id'],
                   },
                 },
               ],
@@ -445,7 +353,6 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
           });
         }
       } else if (request.method === 'tools/call') {
-        // Handle tool calls
         if (!initialized) {
           responses.push({
             jsonrpc: '2.0',
@@ -456,10 +363,7 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
           try {
             const { name, arguments: args } = request.params;
             console.log(`[MCP] Calling tool: ${name} with args:`, args);
-            
-            // Get the tool handler
             const handler = toolHandlers[name];
-            
             if (!handler) {
               responses.push({
                 jsonrpc: '2.0',
@@ -467,16 +371,11 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
                 id: request.id,
               });
             } else {
-              // Execute the tool
               const result = await handler(args);
-              responses.push({
-                jsonrpc: '2.0',
-                result,
-                id: request.id,
-              });
+              responses.push({ jsonrpc: '2.0', result, id: request.id });
             }
           } catch (err: any) {
-            console.error(`[MCP] Tool execution error:`, err);
+            console.error('[MCP] Tool execution error:', err);
             responses.push({
               jsonrpc: '2.0',
               error: { code: -32603, message: err.message },
@@ -485,7 +384,6 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
           }
         }
       } else {
-        // Unknown method
         responses.push({
           jsonrpc: '2.0',
           error: { code: -32601, message: `Method not found: ${request.method}` },
@@ -493,14 +391,12 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
         });
       }
     }
-    
-    // Send response - match the input format
+
     if (Array.isArray(req.body)) {
       res.json(responses);
     } else {
       res.json(responses[0]);
     }
-    
   } catch (err: any) {
     console.error('[MCP] Error:', err);
     res.status(500).json({
@@ -511,21 +407,38 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
   }
 });
 
-// REST endpoints for ChatGPT Actions
+// PUBLIC proxy for downloads so clients don\'t need Graph auth
+app.get('/download/:id', async (req: Request, res: Response) => {
+  try {
+    const itemId = req.params.id as string | undefined;
+    if (!itemId) {
+      return res.status(400).json({ error: 'Missing file ID' });
+    }
+    const meta = await Graph.getItemById(itemId);
+    if (!meta.file) {
+      return res.status(400).json({ error: `Not a file: ${meta.name || itemId}` });
+    }
+    const fileResponse = await Graph.downloadById(itemId);
+    const buf = Buffer.from(await fileResponse.arrayBuffer());
+    res.setHeader('Content-Type', meta.file.mimeType || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${meta.name}"`);
+    res.send(buf);
+  } catch (error: any) {
+    console.error('[Proxy] download error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// REST endpoints for ChatGPT Actions (kept for convenience/testing)
 app.post('/tools/search', async (req: Request, res: Response) => {
   try {
     const query = req.body.q || '';
     console.log(`[Tool] search called with query="${query}"`);
-    
-    if (!query) {
-      return res.json({ results: [] });
-    }
-    
-    // Search SharePoint
+    if (!query) return res.json({ results: [] });
+
     const searchResult = await Graph.search(query, 20);
     const items = searchResult?.value || [];
-    
-    // Convert to simple format for ChatGPT
+
     const results = items.map((item: any) => ({
       id: item.id,
       name: item.name,
@@ -533,12 +446,11 @@ app.post('/tools/search', async (req: Request, res: Response) => {
       mimeType: item.file?.mimeType,
       size: item.size,
       lastModified: item.lastModifiedDateTime,
-      downloadUrl: `https://graph.microsoft.com/v1.0/drives/${DRIVE_ID}/items/${item.id}/content`
+      downloadUrl: `${RESOLVED_BASE_URL}/download/${item.id}`,
     }));
-    
+
     console.log(`[Tool] search("${query}") -> ${results.length} results`);
     return res.json({ results });
-    
   } catch (error: any) {
     console.error('[Tool] search error:', error);
     return res.status(500).json({ error: error.message });
@@ -549,26 +461,17 @@ app.post('/tools/fetch', async (req: Request, res: Response) => {
   try {
     const itemId = req.body.id;
     console.log(`[Tool] fetch called with id="${itemId}"`);
-    
-    if (!itemId) {
-      return res.status(400).json({ error: 'Missing file ID' });
-    }
-    
-    // Get file metadata
+    if (!itemId) return res.status(400).json({ error: 'Missing file ID' });
+
     const meta = await Graph.getItemById(itemId);
-    if (!meta.file) {
-      return res.status(400).json({ error: `Not a file: ${meta.name || itemId}` });
-    }
-    
-    // Download the file content
+    if (!meta.file) return res.status(400).json({ error: `Not a file: ${meta.name || itemId}` });
+
     const fileResponse = await Graph.downloadById(itemId);
     const fileBuffer = await fileResponse.arrayBuffer();
-    
-    // Send file to client
+
     res.setHeader('Content-Type', meta.file.mimeType || 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename="${meta.name}"`);
     res.send(Buffer.from(fileBuffer));
-    
   } catch (error: any) {
     console.error('[Tool] fetch error:', error);
     return res.status(500).json({ error: error.message });
@@ -582,8 +485,8 @@ app.get('/mcp/help', (_req, res) => {
     example: {
       endpoint: 'POST /mcp',
       headers: {
-        'Authorization': 'Bearer YOUR_API_KEY',
-        'Accept': 'application/json, text/event-stream',
+        Authorization: 'Bearer YOUR_API_KEY_OR_OAUTH_TOKEN',
+        Accept: 'application/json, text/event-stream',
         'Content-Type': 'application/json',
       },
       body: [
@@ -593,7 +496,7 @@ app.get('/mcp/help', (_req, res) => {
           method: 'initialize',
           params: {
             clientInfo: { name: 'your-client', version: '1.0.0' },
-            protocolVersion: '2024-11-05',
+            protocolVersion: '2025-06-18',
             capabilities: {},
           },
         },
@@ -603,10 +506,7 @@ app.get('/mcp/help', (_req, res) => {
           method: 'tools/call',
           params: {
             name: 'search',
-            arguments: {
-              query: 'your search query',
-              top: 10,
-            },
+            arguments: { query: 'your search query', top: 10 },
           },
         },
       ],
@@ -622,9 +522,10 @@ app.get('/mcp/help', (_req, res) => {
       },
       {
         name: 'fetch',
-        description: 'Fetch a file by item id',
+        description: 'Fetch file(s) by item id',
         parameters: {
-          id: 'SharePoint item ID (required)',
+          id: 'SharePoint item ID (optional if ids provided)',
+          ids: 'Array of SharePoint item IDs (optional)',
         },
       },
     ],
@@ -634,5 +535,6 @@ app.get('/mcp/help', (_req, res) => {
 app.listen(Number(PORT), () => {
   console.log(`MCP server on :${PORT} — scoped to ${FOLDER_ITEM_ID ? `folder ${FOLDER_ITEM_ID}` : 'drive root'}`);
   console.log('Server expects batch requests: [initialize, method_call]');
+  console.log('Public base URL:', RESOLVED_BASE_URL);
   console.log('See /mcp/help for usage examples');
 });
