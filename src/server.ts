@@ -201,8 +201,8 @@ app.use(express.json({ limit: '2mb' }));
 app.use(cors({
   origin: ['https://chat.openai.com', 'https://chatgpt.com'],
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Authorization', 'Content-Type', 'Accept', 'MCP-Protocol-Version', 'Origin'],
-  exposedHeaders: ['WWW-Authenticate'],
+  allowedHeaders: ['Authorization', 'Content-Type', 'Accept', 'MCP-Protocol-Version', 'Origin', 'Mcp-Session-Id'],
+  exposedHeaders: ['WWW-Authenticate', 'Mcp-Session-Id'],
 }));
 
 // PUBLIC endpoints (mount BEFORE auth)
@@ -447,23 +447,23 @@ app.post('/mcp', auth, async (req: Request, res: Response) => {
   }
 });
 
-// SSE endpoint with proper session handling
-app.all('/mcp/sse', auth, async (req, res) => {
+// Simplified MCP endpoint for Deep Research connectors
+app.post('/mcp/connect', auth, async (req, res) => {
   try {
     const server = buildMcpServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => Math.random().toString(36).slice(2),
     });
     
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+    
     res.on('close', () => {
       transport.close();
       server.close();
     });
-    
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
   } catch (err: any) {
-    console.error('[SSE] Error:', err);
+    console.error('[MCP] Error:', err);
     if (!res.headersSent) {
       res.status(500).json({
         jsonrpc: '2.0',
@@ -473,6 +473,8 @@ app.all('/mcp/sse', auth, async (req, res) => {
     }
   }
 });
+
+
 
 // PUBLIC proxy for downloads so clients don\'t need Graph auth
 app.get('/download/:id', async (req: Request, res: Response) => {
